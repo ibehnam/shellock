@@ -37,6 +37,16 @@ DIM: Final[str] = "\033[2m"
 RESET: Final[str] = "\033[0m"
 CYAN: Final[str] = "\033[36m"
 
+# Command-specific help overrides
+# Some commands need special help invocations to show all flags
+HELP_SOURCE_OVERRIDES: Final[dict[str, list[str] | callable]] = {
+    "curl": ["curl", "--help", "all"],
+    "git": lambda subcmd: ["git", "help", subcmd] if subcmd else ["git", "-h"],
+    "docker": lambda subcmd: ["docker", subcmd, "--help"] if subcmd else ["docker", "--help"],
+    "kubectl": lambda subcmd: ["kubectl", subcmd, "--help"] if subcmd else ["kubectl", "--help"],
+    "npm": lambda subcmd: ["npm", subcmd, "--help"] if subcmd else ["npm", "--help"],
+}
+
 
 @dataclass(frozen=True, slots=True)
 class Flag:
@@ -229,11 +239,30 @@ def parse_help_output(*, help_text: str) -> dict[str, str]:
         r"^\s*(--[\w-]+)(?:\[?=\S*\]?)?\s{2,}(.+)$",
         # Long flag with positional arg: --temp N  description
         r"^\s*(--[\w-]+)\s+\S+\s{2,}(.+)$",
+        # Short flag with arg: -x arg  description
+        r"^\s*(-[^\s])\s+\S+\s{2,}(.+)$",
         # Short only: -x  Description
-        r"^\s*(-\w)\s{2,}(.+)$",
+        r"^\s*(-[^\s])\s{2,}(.+)$",
         # Brackets style: [-x]  Description
-        r"^\s*\[(-\w)\]\s{2,}(.+)$",
+        r"^\s*\[(-[^\s])\]\s{2,}(.+)$",
     ]
+
+    # Special handling for lines with multiple mode flags (e.g., tar -c Create -r Add/Replace)
+    import re
+
+    mode_flags = {}
+    for line in help_text.split("\n"):
+        line = line.rstrip()
+        # Look for mode flag patterns like: -c Create  -r Add/Replace
+        if re.search(r"-\w\s+[A-Z][a-z]+", line):
+            # Split by flag indicators
+            parts = re.finditer(r"(-[^\s,\s]+)\s+([A-Z][a-zA-Z]+(?:\s+\w+)*)", line)
+            for match in parts:
+                flag, desc = match.groups()
+                mode_flags[flag] = desc
+
+    # Add mode flags to the results
+    flags.update(mode_flags)
 
     for line in help_text.split("\n"):
         line = line.rstrip()
@@ -289,33 +318,37 @@ def parse_man_page(*, man_text: str) -> dict[str, str]:
     # - Tree style: -L level (arg without angle brackets)
     flag_line_patterns = [
         # Git style: exactly 7 spaces, -x, --long-option
-        r"^(       )(-\w)(?:,\s+(--[\w-]+))?\s*$",
+        r"^(       )(-[^\s])(?:,\s+(--[\w-]+))?\s*$",
         # Git style: -x <arg>, --long-option=<arg> (like -C <path>)
-        r"^(       )(-\w)\s+<[^>]+>(?:,\s+(--[\w-]+)(?:=<[^>]+>)?)?\s*$",
+        r"^(       )(-[^\s])\s+<[^>]+>(?:,\s+(--[\w-]+)(?:=<[^>]+>)?)?\s*$",
         # Git style: -x <name>=<value> (like -c <name>=<value>)
-        r"^(       )(-\w)\s+<[^>]+=<[^>]+>\s*$",
+        r"^(       )(-[^\s])\s+<[^>]+=<[^>]+>\s*$",
         # Git style: --long-option only (like --bare)
         r"^(       )(--[\w-]+)(?:\[?=<[^>]+>\]?)?\s*$",
         # Git style: --config-env=<name>=<envvar>
         r"^(       )(--[\w-]+=)<[^>]+=<[^>]+>\s*$",
         # GNU: -x <arg>, --long-option=<arg> on own line
-        r"^(\s{1,12})(-\w)(?:\s+<\S+>)?(?:,\s*(--[\w-]+)(?:=<\S+>)?)?\s*$",
+        r"^(\s{1,12})(-[^\s])(?:\s+<\S+>)?(?:,\s*(--[\w-]+)(?:=<\S+>)?)?\s*$",
         # GNU: --long-option=<arg>, -x <arg> on own line
-        r"^(\s{1,12})(--[\w-]+)(?:=<\S+>)?(?:,\s*(-\w)(?:\s+<\S+>)?)?\s*$",
+        r"^(\s{1,12})(--[\w-]+)(?:=<\S+>)?(?:,\s*(-[^\s])(?:\s+<\S+>)?)?\s*$",
         # GNU: --long-option on own line
         r"^(\s{1,12})(--[\w-]+)(?:=\S+)?\s*$",
         # Multiple short/long flags: -R, -r, --recursive (no description)
-        r"^(\s{1,12})(-\w)(?:,\s*(-\w))?(?:,\s*(--[\w-]+))?\s*$",
+        r"^(\s{1,12})(-[^\s])(?:,\s*(-[^\s]))?(?:,\s*(--[\w-]+))?\s*$",
         # Tree style: -X arg (arg without brackets, on own line, may have no indent)
-        r"^(\s*)(-\w)\s+[a-z]+\s*$",
+        r"^(\s*)(-[^\s])\s+[a-z]+\s*$",
         # Find style: -name pattern (single-dash long flag with arg, 4+ letters)
         r"^(\s*)(-[a-z]{4,})\s+[a-z]+\s*$",
+        # Find style with XY suffix: -newerXY reference
+        r"^(\s*)(-[a-z]+(?:XY|[A-Z]{2}))\s+\S+\s*$",
         # Find style with complex args: -exec utility [argument ...] ;
         r"^(\s*)(-[a-z]{4,})\s+\S+",
         # BSD style: -x      Description (6+ spaces before description)
-        r"^(\s{1,12})(-\w)\s{4,}(\S.*)$",
+        r"^(\s{1,12})(-[^\s])\s{4,}(\S.*)$",
         # Long flag with description on same line
         r"^(\s{1,12})(--[\w-]+)\s{4,}(\S.*)$",
+        # Multiple flags with description on same line (BSD/GNU style)
+        r"^(\s*)(-\w)(?:,\s*(-\w))*\s{4,}(\S.*)$",
     ]
 
     current_flags: list[str] = []
@@ -396,7 +429,31 @@ def get_help_text(*, command: str, subcommand: str | None = None) -> str | None:
     Get help output for a command.
 
     Tries multiple approaches: --help, -h, help subcommand.
+    Uses command-specific overrides for complex commands like curl.
     """
+    # Check for command-specific help overrides
+    if command in HELP_SOURCE_OVERRIDES:
+        help_source = HELP_SOURCE_OVERRIDES[command]
+        # Handle callable (for commands that need subcommand handling)
+        if callable(help_source):
+            cmd = help_source(subcommand)
+        else:
+            cmd = help_source.copy()
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            output = result.stdout or result.stderr
+            if output and len(output) > 50 and "-" in output:
+                return output
+        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+            pass
+
+    # Fall back to standard help options
     base_cmd = [command]
     if subcommand:
         base_cmd.append(subcommand)
@@ -509,6 +566,22 @@ def lookup_flag(
     # fall back to the parent command (e.g., git -c is a git-level flag, not git-status)
     if flag not in all_flags and subcommand is not None:
         return lookup_flag(command=command, flag=flag, subcommand=None)
+
+    # If flag not found, check if it's a combination of short flags
+    # (e.g., -xf = -x + -f, -rf = -r + -f), but not --long-flags
+    if flag not in all_flags and re.match(r"^-[a-zA-Z]{2,}$", flag):
+        # Extract individual short flags (skip the leading dash)
+        chars = flag[1:]
+        descriptions: list[str] = []
+        for char in chars:
+            if char.isalpha():
+                single_flag = f"-{char}"
+                if single_flag in all_flags:
+                    descriptions.append(f"{single_flag}: {all_flags[single_flag]}")
+
+        if descriptions:
+            # Return combined description
+            return "Combination: " + " | ".join(descriptions)
 
     return all_flags.get(flag)
 
