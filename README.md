@@ -19,6 +19,8 @@ $ tree -L 2 -a -C
 curl -fsSL https://raw.githubusercontent.com/ibehnam/shellock/main/install-curl.fish | fish
 ```
 
+> **Note**: If you get a 404 error, wait a few seconds and try again. GitHub's CDN may take a moment to update.
+
 ### Clone and install
 
 ```fish
