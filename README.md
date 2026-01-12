@@ -16,7 +16,7 @@ $ tree -L 2 -a -C
 ### One-liner install (recommended)
 
 ```fish
-curl -fsSL https://raw.githubusercontent.com/ibehnam/shellock/main/install.fish | fish
+curl -fsSL https://raw.githubusercontent.com/ibehnam/shellock/main/install-curl.fish | fish
 ```
 
 ### Clone and install
