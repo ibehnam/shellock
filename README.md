@@ -13,14 +13,18 @@ $ tree -L 2 -a -C
 
 ## Installation
 
+### One-liner install (recommended)
+
+```fish
+curl -fsSL https://raw.githubusercontent.com/ibehnam/shellock/main/install.fish | fish
+```
+
+### Clone and install
+
 ```fish
 # Clone to your preferred location (e.g., ~/.local/share/shellock)
 git clone https://github.com/ibehnam/shellock.git ~/.local/share/shellock
 cd ~/.local/share/shellock
-
-# Or download and extract anywhere you like, then cd into that directory
-
-# Run the installer
 fish install.fish
 ```
 
