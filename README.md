@@ -14,8 +14,13 @@ $ tree -L 2 -a -C
 ## Installation
 
 ```fish
-# Clone or download to ~/Downloads/shellock
-cd ~/Downloads/shellock
+# Clone to your preferred location (e.g., ~/.local/share/shellock)
+git clone https://github.com/ibehnam/shellock.git ~/.local/share/shellock
+cd ~/.local/share/shellock
+
+# Or download and extract anywhere you like, then cd into that directory
+
+# Run the installer
 fish install.fish
 ```
 
@@ -38,20 +43,22 @@ After installation, explanations appear automatically as you type:
 
 ## CLI Tool
 
-You can also use shellock directly:
+You can also use shellock directly from its directory:
 
 ```bash
-# Explain flags in a command
+# From the shellock directory
 ./shellock.py explain "git commit -am 'message'"
 
-# Look up a specific flag
-./shellock.py lookup git -m --subcommand commit
+# Or use the full path to shellock.py
+/path/to/shellock/shellock.py lookup git -m --subcommand commit
 
 # Parse command structure (JSON output)
 ./shellock.py parse "rsync -avz src/ dest/"
 
 # Clear cache
 ./shellock.py clear-cache
+
+# For fish shell integration, make sure to run the installer
 ```
 
 ## Supported Formats
@@ -73,17 +80,17 @@ Shellock parses various man page formats:
 ## Files
 
 ```
-~/Downloads/shellock/
+shellock/
 ├── shellock.py          # Main Python script
 ├── shellock.fish        # Fish shell functions
-├── shellock_bindings.fish # Key bindings (symlinked to config)
+├── shellock_bindings.fish # Key bindings (symlinked to ~/.config/fish/conf.d/)
 ├── install.fish         # Installer script
 └── README.md            # This file
 ```
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.13+ (for optimal performance and latest features)
 - fish shell
 - Standard Unix tools (man, col)
 
