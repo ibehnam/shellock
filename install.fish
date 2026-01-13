@@ -1,7 +1,7 @@
 #!/usr/bin/env fish
 # Shellock installer for fish shell
 
-set -l shellock_dir (dirname (status filename))
+set -l shellock_dir (realpath (dirname (status filename)))
 set -l config_dir "$HOME/.config/fish/conf.d"
 
 echo "Installing Shellock..."
