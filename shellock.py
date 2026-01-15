@@ -431,6 +431,10 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
     while i < len(tokens):
         token = tokens[i]
 
+        if token == "--":
+            # Option terminator: stop parsing flags, keep prior hints.
+            break
+
         # Skip this token if it's a flag value (from previous flag)
         if skip_next:
             skip_next = False
@@ -504,6 +508,26 @@ def truncate_description(text: str, max_length: int = 160) -> str:
     return truncated + "..."
 
 
+def wrap_text(text: str, width: int = 80) -> list[str]:
+    """Wrap text to multiple lines at word boundaries."""
+    if len(text) <= width:
+        return [text]
+
+    lines = []
+    while len(text) > width:
+        # Find last space before width
+        wrap_pos = text.rfind(" ", 0, width)
+        if wrap_pos == -1:  # No space found, hard wrap
+            wrap_pos = width
+        lines.append(text[:wrap_pos])
+        text = text[wrap_pos:].lstrip()
+
+    if text:
+        lines.append(text)
+
+    return lines
+
+
 def strip_man_formatting(*, text: str) -> str:
     """
     Strip man page formatting (bold/underline via backspace sequences).
@@ -570,7 +594,7 @@ def parse_help_output(*, help_text: str) -> dict[str, str]:
             parts = re.finditer(r"(-[^\s,\s]+)\s+([A-Z][a-zA-Z]+(?:\s+\w+)*)", line)
             for match in parts:
                 flag, desc = match.groups()
-                mode_flags[flag] = desc
+                mode_flags[flag] = truncate_description(desc)
 
     # Add mode flags to the results
     flags.update(mode_flags)
@@ -584,14 +608,14 @@ def parse_help_output(*, help_text: str) -> dict[str, str]:
                 groups = match.groups()
                 if len(groups) == 3:
                     first, second, desc = groups
-                    desc = desc.strip()
+                    desc = truncate_description(desc.strip())
                     if first:
                         flags[first] = desc
                     if second:
                         flags[second] = desc
                 elif len(groups) == 2:
                     flag, desc = groups
-                    flags[flag] = desc.strip()
+                    flags[flag] = truncate_description(desc.strip())
                 break
 
     return flags
@@ -982,12 +1006,23 @@ def format_explanations(
 
     for exp in explanations:
         flag_padded = exp.flag.ljust(max_flag_len)
+        desc_lines = wrap_text(exp.description, width=80)
+
+        # First line with flag
         if use_color:
             lines.append(
-                f"{DIM}  {CYAN}{flag_padded}{RESET}  {DIM}{exp.description}{RESET}"
+                f"{DIM}  {CYAN}{flag_padded}{RESET}  {DIM}{desc_lines[0]}{RESET}"
             )
         else:
-            lines.append(f"  {flag_padded}  {exp.description}")
+            lines.append(f"  {flag_padded}  {desc_lines[0]}")
+
+        # Continuation lines (indented to align with description)
+        for cont_line in desc_lines[1:]:
+            indent = " " * (max_flag_len + 4)  # 2 spaces + flag + 2 spaces
+            if use_color:
+                lines.append(f"{DIM}{indent}{cont_line}{RESET}")
+            else:
+                lines.append(f"{indent}{cont_line}")
 
     return "\n".join(lines)
 
