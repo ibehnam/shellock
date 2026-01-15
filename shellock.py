@@ -167,7 +167,7 @@ def _parse_first_json_value(*, text: str) -> object:
 
 @dataclass(frozen=True, slots=True)
 class ClaudeCodeAgent:
-    model: str = "sonnet"
+    model: str = "haiku"
     executable: str = "claude"
 
     def run_json(
@@ -358,7 +358,37 @@ def _load_config() -> dict:
 
 
 def _config_get(*, key: str) -> object | None:
+    # Environment variables override config.json for quick experimentation.
+    # Example: `SHELLOCK_SCAN_BACKEND=llm`, `SHELLOCK_LLM_MODEL=haiku`.
+    env_key = f"SHELLOCK_{key.upper()}"
+    env_val = os.environ.get(env_key)
+    if env_val is not None and env_val.strip() != "":
+        return env_val
     return _load_config().get(key)
+
+
+def _doc_order() -> list[str]:
+    cfg = _config_get(key="doc_order")
+    if isinstance(cfg, str):
+        items = [part.strip().lower() for part in cfg.split(",")]
+    elif isinstance(cfg, list):
+        items = [item.strip().lower() for item in cfg if isinstance(item, str)]
+    else:
+        items = []
+
+    allowed = {"man", "help"}
+    ordered: list[str] = []
+    for item in items:
+        if item in allowed and item not in ordered:
+            ordered.append(item)
+
+    default_order = ["man", "help"]
+    if not ordered:
+        return default_order
+    for item in default_order:
+        if item not in ordered:
+            ordered.append(item)
+    return ordered
 
 
 def _command_file_name(command: str) -> str:
@@ -491,11 +521,22 @@ def _sources_from_docs(*, docs: HelpAndMan) -> Sources:
 
 
 def _primary_doc_text(*, docs: HelpAndMan) -> tuple[str, str] | None:
-    if docs.man_text:
-        return ("man", docs.man_text)
-    if docs.help_text:
-        return ("help", docs.help_text)
+    for kind in _doc_order():
+        if kind == "man" and docs.man_text:
+            return ("man", docs.man_text)
+        if kind == "help" and docs.help_text:
+            return ("help", docs.help_text)
     return None
+
+
+def _docs_for_scan(*, docs: HelpAndMan) -> HelpAndMan:
+    primary = _primary_doc_text(docs=docs)
+    if primary is None:
+        return HelpAndMan(help_text=None, man_text=None)
+    kind, _text = primary
+    if kind == "help":
+        return HelpAndMan(help_text=docs.help_text, man_text=None)
+    return HelpAndMan(help_text=None, man_text=docs.man_text)
 
 
 def _truncate_for_prompt(*, text: str, max_chars: int) -> str:
@@ -513,18 +554,18 @@ def generate_command_data_llm(
     max_doc_chars: int,
     timeout_s: int,
 ) -> CommandData:
-    """Generate and persist command JSON using an external LLM agent.
-
-    Priority: man page if present, otherwise help output.
-    """
+    """Generate and persist command JSON using an external LLM agent."""
     root_docs = _get_help_and_man(protocol=protocol, command=command, subcommand=None)
+    root_used = _docs_for_scan(docs=root_docs)
     root_primary = _primary_doc_text(docs=root_docs)
     if root_primary is None:
         raise LlmAgentError(f"No man page or help output found for: {command}")
 
     discovered = sorted(
         protocol.subcommands.discover(
-            command=command, help_text=root_docs.help_text, man_text=root_docs.man_text
+            command=command,
+            help_text=root_used.help_text,
+            man_text=root_used.man_text,
         )
     )
     subcommands = discovered[: max(0, max_subcommands)]
@@ -548,8 +589,8 @@ def generate_command_data_llm(
                 f"protocol_version must be: {PROTOCOL_VERSION}",
                 f"generated_at must be: {now}",
                 "",
-                "Fill `sources` booleans based on whether the docs are present (help/man).",
-                "Prefer man pages when both help and man are available.",
+                "Fill `sources` booleans based on which docs are used (help/man).",
+                f"Documentation order: {', '.join(_doc_order())}",
                 "",
             ]
         )
@@ -562,10 +603,11 @@ def generate_command_data_llm(
     sub_docs: dict[str, HelpAndMan] = {}
     for sub in subcommands:
         docs = _get_help_and_man(protocol=protocol, command=command, subcommand=sub)
+        used = _docs_for_scan(docs=docs)
         primary = _primary_doc_text(docs=docs)
         if primary is None:
             continue
-        sub_docs[sub] = docs
+        sub_docs[sub] = used
         kind, text = primary
         prompt_parts.append(f"== {command} {sub} ({kind}) ==")
         prompt_parts.append(_truncate_for_prompt(text=text, max_chars=max_doc_chars))
@@ -585,7 +627,7 @@ def generate_command_data_llm(
     candidate["protocol_version"] = PROTOCOL_VERSION
     candidate["command"] = command
     candidate["generated_at"] = now
-    candidate["sources"] = _sources_from_docs(docs=root_docs)
+    candidate["sources"] = _sources_from_docs(docs=root_used)
 
     if not isinstance(candidate.get("flags"), dict):
         candidate["flags"] = {}
@@ -620,6 +662,7 @@ def generate_subcommand_data_llm(
     timeout_s: int,
 ) -> SubcommandData:
     docs = _get_help_and_man(protocol=protocol, command=command, subcommand=subcommand)
+    used_docs = _docs_for_scan(docs=docs)
     primary = _primary_doc_text(docs=docs)
     if primary is None:
         raise LlmAgentError(
@@ -659,7 +702,7 @@ def generate_subcommand_data_llm(
         raise LlmAgentError("Agent output was not a JSON object")
 
     candidate["generated_at"] = now
-    candidate["sources"] = _sources_from_docs(docs=docs)
+    candidate["sources"] = _sources_from_docs(docs=used_docs)
     if not isinstance(candidate.get("flags"), dict):
         candidate["flags"] = {}
 
@@ -685,34 +728,31 @@ def _setting_int(*, config_key: str, default: int) -> int:
 
 def _llm_agent_from_env() -> StructuredJsonAgent:
     cfg = _config_get(key="llm_model")
-    model = cfg.strip() if isinstance(cfg, str) and cfg.strip() else "sonnet"
+    model = cfg.strip() if isinstance(cfg, str) and cfg.strip() else "haiku"
     return ClaudeCodeAgent(model=model)
 
 
 def _scan_flags_and_subcommands(
     *, protocol: CommandProtocol, command: str, subcommand: str | None
 ) -> ScanResult:
-    help_text = protocol.help_provider.get_help_text(
-        command=command, subcommand=subcommand
+    docs = _get_help_and_man(
+        protocol=protocol, command=command, subcommand=subcommand
     )
-    man_text = protocol.help_provider.get_man_text(
-        command=command, subcommand=subcommand
-    )
+    used_docs = _docs_for_scan(docs=docs)
 
     flags: dict[str, str] = {}
-    sources = {"help": False, "man": False}
+    sources = _sources_from_docs(docs=used_docs)
 
-    if help_text:
-        sources["help"] = True
-        flags.update(protocol.extractor.extract_from_help(help_text=help_text))
+    if used_docs.help_text:
+        flags.update(protocol.extractor.extract_from_help(help_text=used_docs.help_text))
 
-    if man_text:
-        sources["man"] = True
-        for k, v in protocol.extractor.extract_from_man(man_text=man_text).items():
-            flags.setdefault(k, v)
+    if used_docs.man_text:
+        flags.update(protocol.extractor.extract_from_man(man_text=used_docs.man_text))
 
     discovered_subcommands = protocol.subcommands.discover(
-        command=command, help_text=help_text, man_text=man_text
+        command=command,
+        help_text=used_docs.help_text,
+        man_text=used_docs.man_text,
     )
 
     return ScanResult(
@@ -766,6 +806,32 @@ def spawn_background_scan(*, command: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def _notify_fish_scan_complete(*, command: str) -> None:
+    """Best-effort notification for interactive fish sessions.
+
+    Background scans run detached, so fish won't re-run `__shellock_explain`
+    unless the user types again. We use a universal variable update as an
+    inter-process signal: interactive fish sessions can listen for changes
+    to `__shellock_scan_done` and refresh the hint.
+    """
+    payload = f"{command}:{int(time.time() * 1000)}"
+    try:
+        subprocess.run(
+            ["fish", "-c", 'set -U __shellock_scan_done -- "$SHELLOCK_SCAN_DONE"'],
+            env={**os.environ, "SHELLOCK_SCAN_DONE": payload},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
+    except Exception:
+        # Non-fatal: shellock still works without live refresh.
+        return
 
 
 def ensure_command_scanned(
@@ -1670,7 +1736,7 @@ def main() -> int:
     )
     gen_p.add_argument("command", help="Command to generate data for")
     gen_p.add_argument("--agent", default="claude", choices=["claude"])
-    gen_p.add_argument("--model", default=model_default or "sonnet")
+    gen_p.add_argument("--model", default=model_default or "haiku")
     gen_p.add_argument(
         "--max-subcommands",
         type=int,
@@ -1775,6 +1841,7 @@ def main() -> int:
             ensure_command_scanned(
                 protocol=protocol, command=args.command, refresh=False
             )
+            _notify_fish_scan_complete(command=args.command)
         finally:
             lock_path.unlink(missing_ok=True)
         return 0

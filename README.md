@@ -30,6 +30,12 @@ cd ~/downloads/shellock
 fish install.fish
 ```
 
+The installer creates:
+- `~/.config/fish/shellock/config.json` (defaults; not overwritten if present)
+- `~/.config/fish/shellock/data/` (durable per-command metadata)
+
+You can override the base directory with `SHELLOCK_HOME`.
+
 ## Usage
 
 After installation, explanations appear automatically as you type:
@@ -90,35 +96,37 @@ Requirements:
 
 Examples:
 
-```bash
-# Generate and cache JSON (also prints it)
-~/.config/fish/functions/shellock.py generate git --print
+	```bash
+	# Generate and cache JSON (also prints it)
+	~/.config/fish/functions/shellock.py generate git --print
+	
+	# Use LLM scanning for background learning/refresh as well
+	export SHELLOCK_SCAN_BACKEND=llm
+	export SHELLOCK_LLM_MODEL=haiku
+	```
+	
+	Config file (optional, only if you want to customize defaults):
+	
+	Shellock reads `~/.config/fish/shellock/config.json` for configuration. Example:
 
-# Use LLM scanning for background learning/refresh as well
-export SHELLOCK_SCAN_BACKEND=llm
-export SHELLOCK_LLM_MODEL=sonnet
-```
+	```json
+	{
+	  "scan_backend": "llm",
+	  "doc_order": ["help", "man"],
+	  "llm_model": "haiku",
+	  "llm_max_subcommands": 25,
+	  "llm_max_doc_chars": 30000,
+	  "llm_timeout_s": 180
+	}
+	```
 
-Config file (required for customization):
-
-Shellock reads `~/.config/fish/shellock/config.json` for configuration. Example:
-
-```json
-{
-  "scan_backend": "llm",
-  "llm_model": "sonnet",
-  "llm_max_subcommands": 25,
-  "llm_max_doc_chars": 30000,
-  "llm_timeout_s": 180
-}
-```
-
-Defaults:
-- `scan_backend`: `llm` (LLM then regex fallback)
-- `llm_model`: `sonnet`
-- `llm_max_subcommands`: `25`
-- `llm_max_doc_chars`: `30000`
-- `llm_timeout_s`: `180`
+	Defaults:
+	- `scan_backend`: `llm` (LLM then regex fallback)
+	- `doc_order`: `["man", "help"]` (scan `man` first, fall back to `help` only if missing)
+	- `llm_model`: `haiku`
+	- `llm_max_subcommands`: `25`
+	- `llm_max_doc_chars`: `30000`
+	- `llm_timeout_s`: `180`
 
 ## Data Storage
 

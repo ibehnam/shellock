@@ -7,10 +7,14 @@ echo "Installing Shellock to fish functions directory..."
 set -l source_dir (dirname (realpath (status filename)))
 set -l functions_dir "$HOME/.config/fish/functions"
 set -l conf_dir "$HOME/.config/fish/conf.d"
+set -l shellock_home (set -q SHELLOCK_HOME; and echo "$SHELLOCK_HOME"; or echo "$HOME/.config/fish/shellock")
+set -l shellock_config "$shellock_home/config.json"
+set -l shellock_data "$shellock_home/data"
 
 # Create directories if needed
 mkdir -p "$functions_dir"
 mkdir -p "$conf_dir"
+mkdir -p "$shellock_data"
 
 # Copy files to functions directory
 echo "Copying files to $functions_dir..."
@@ -31,8 +35,25 @@ ln -s "$functions_dir/shellock_bindings.fish" "$target"
 echo "Created symlink: $target"
 
 # Create Shellock data directory
-mkdir -p "$HOME/.config/fish/shellock/data"
-echo "Created data directory: ~/.config/fish/shellock/data"
+echo "Created data directory: $shellock_data"
+
+# Create default config if missing (do not overwrite existing config)
+if not test -e "$shellock_config"
+    mkdir -p "$shellock_home"
+    set -l tmp_cfg "$shellock_config.tmp.$fish_pid"
+    printf '%s\n' \
+        '{' \
+        '  "scan_backend": "llm",' \
+        '  "doc_order": ["man", "help"],' \
+        '  "llm_model": "haiku",' \
+        '  "llm_max_subcommands": 25,' \
+        '  "llm_max_doc_chars": 30000,' \
+        '  "llm_timeout_s": 180' \
+        '}' \
+        > "$tmp_cfg"
+    mv "$tmp_cfg" "$shellock_config"
+    echo "Created default config: $shellock_config"
+end
 
 echo ""
 echo "Installation complete!"

@@ -64,6 +64,36 @@ function __shellock_clear
     end
 end
 
+function __shellock_on_scan_done --on-variable __shellock_scan_done
+    # Payload format: "<command>:<epoch_ms>"
+    set -l payload "$__shellock_scan_done"
+    if test -z "$payload"
+        return
+    end
+
+    set -l scanned_cmd (string split -m1 : -- "$payload")[1]
+    if test -z "$scanned_cmd"
+        return
+    end
+
+    set -l cmdline (commandline -b)
+    set -l trimmed (string trim -- "$cmdline")
+    if test -z "$trimmed"
+        return
+    end
+
+    # Only refresh if the current command looks like it matches the scanned command.
+    # (Prevents unrelated scans from triggering redraws.)
+    if not string match -q '*-*' "$trimmed"
+        return
+    end
+
+    set -l scanned_cmd_re (string escape --style=regex -- "$scanned_cmd")
+    if string match -qr "^$scanned_cmd_re(\\s|\$)" "$trimmed"
+        __shellock_explain
+    end
+end
+
 function __shellock_on_dash
     # Insert the dash character
     commandline -i '-'
@@ -72,7 +102,9 @@ function __shellock_on_dash
 end
 
 function __shellock_on_space
-    # Insert space
+    # Expand abbreviations before inserting space (preserves `abbr` behavior)
+    commandline -f expand-abbr
+    # Insert a literal space
     commandline -i ' '
     # Check if we should update explanations
     set -l cmdline (commandline -b)
@@ -83,6 +115,8 @@ function __shellock_on_space
 end
 
 function __shellock_on_enter
+    # Expand abbreviations before execution (preserves `abbr` behavior on Enter)
+    commandline -f expand-abbr
     # Clear explanations before executing
     __shellock_clear
     # Execute the command
