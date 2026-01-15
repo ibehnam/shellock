@@ -56,7 +56,9 @@ After installation, explanations appear automatically as you type:
 3. **Background Scanning** (first use only): Spawns detached process to parse `--help` output and man pages
 4. **Data Store**: Saves per-command flag metadata with atomic writes for fast subsequent lookups
 5. **Display**: Renders explanations below your prompt using ANSI escape codes
-6. **Smart Truncation**: Long descriptions end at sentence/word boundaries, not mid-word
+   - **Text Wrapping**: Long descriptions wrap at 80 chars on word boundaries, with continuation lines indented
+   - **Smart Truncation**: Descriptions end at sentence/word boundaries (160 char max), not mid-word
+6. **Proper Cleanup**: Multi-line output ensures fish clears all wrapped text when you delete flags
 
 ## CLI Tool
 

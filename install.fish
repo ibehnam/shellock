@@ -4,7 +4,7 @@
 echo "Installing Shellock to fish functions directory..."
 
 # Define source and destination
-set -l source_dir (dirname (status filename))
+set -l source_dir (dirname (realpath (status filename)))
 set -l functions_dir "$HOME/.config/fish/functions"
 set -l conf_dir "$HOME/.config/fish/conf.d"
 

@@ -18,3 +18,5 @@ build/
 .claude
 .codex
 .opencode
+CLAUDE.md
+AGENTS.md
