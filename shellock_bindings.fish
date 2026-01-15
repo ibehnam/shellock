@@ -36,3 +36,19 @@ bind -M default \b __shellock_on_backspace
 # Update on delete key
 bind -M insert \e\[3~ __shellock_on_delete
 bind -M default \e\[3~ __shellock_on_delete
+
+# Update on kill-whole-line (Ctrl+U)
+bind -M insert \cu __shellock_on_kill_whole_line
+bind -M default \cu __shellock_on_kill_whole_line
+
+# Update on kill-line (Ctrl+K)
+bind -M insert \ck __shellock_on_kill_line
+bind -M default \ck __shellock_on_kill_line
+
+# Update on backward-kill-word (Ctrl+W)
+bind -M insert \cw __shellock_on_backward_kill_word
+bind -M default \cw __shellock_on_backward_kill_word
+
+# Update on kill-word (Alt+D)
+bind -M insert \ed __shellock_on_kill_word
+bind -M default \ed __shellock_on_kill_word

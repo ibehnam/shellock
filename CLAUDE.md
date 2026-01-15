@@ -15,10 +15,13 @@ Shellock is a real-time CLI flag explainer for fish shell, written in Python 3.1
 **Data Flow:**
 1. User types in fish → Key binding triggers `__shellock_explain`
 2. Fish sends command to Python script → `parse_command_line()` extracts flags
-3. Python looks up flags → Ensures command metadata exists (auto-scan on first use) then serves from JSON
-4. Help parsing → `parse_help_output()` handles multiple formats (GNU, BSD, single-dash long flags)
+3. Python looks up flags → Non-blocking check for command metadata
+   - If data exists: serves from JSON immediately
+   - If missing: spawns background scan process, returns "Learning \<command\>..." message
+4. Background scan (first use only) → `parse_help_output()` and `parse_man_page()` extract flags from help/man pages
 5. Results returned to fish → Rendered below prompt with ANSI colors
-6. Command metadata stored → `~/.config/fish/shellock/data/<command>.json`
+6. Command metadata stored → `~/.config/fish/shellock/data/<command>.json` (atomic writes)
+7. Lock files → `.scanning` files prevent duplicate background scans (5-minute timeout)
 
 **Command-Specific Handling:**
 The `HELP_SOURCE_OVERRIDES` dict provides special handling for complex commands like git, docker, kubectl that need subcommand-aware help invocation (e.g., `git help commit` vs `git -h`).
@@ -45,3 +48,6 @@ The `HELP_SOURCE_OVERRIDES` dict provides special handling for complex commands 
 - Command metadata stored per command under `~/.config/fish/shellock/data/`
 - Fish integration uses global `__shellock_lines` variable for cleanup tracking
 - Pattern matching in fish functions uses `string match` for cross-platform compatibility
+- **Non-blocking architecture**: First-time command scans happen in background processes (detached via `start_new_session=True`)
+- **Smart truncation**: Descriptions truncated at sentence/word boundaries, not mid-word
+- **Key bindings**: Handles Ctrl+U, Ctrl+K, Ctrl+W, Alt+D for proper hint cleanup on line edits

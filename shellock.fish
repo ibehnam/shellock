@@ -113,3 +113,31 @@ function __shellock_on_delete
     # Update explanations (will clear if no flags left)
     __shellock_explain
 end
+
+function __shellock_on_kill_whole_line
+    # Kill entire line (Ctrl+U)
+    commandline -f kill-whole-line
+    # Update explanations (will clear since no content remains)
+    __shellock_explain
+end
+
+function __shellock_on_kill_line
+    # Kill to end of line (Ctrl+K)
+    commandline -f kill-line
+    # Update explanations
+    __shellock_explain
+end
+
+function __shellock_on_backward_kill_word
+    # Kill word backward (Ctrl+W)
+    commandline -f backward-kill-word
+    # Update explanations
+    __shellock_explain
+end
+
+function __shellock_on_kill_word
+    # Kill word forward (Alt+D)
+    commandline -f kill-word
+    # Update explanations
+    __shellock_explain
+end

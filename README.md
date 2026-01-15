@@ -40,12 +40,23 @@ After installation, explanations appear automatically as you type:
 - Press `Ctrl+C` to cancel (clears explanations)
 - Press `Ctrl+H` for manual help on current command
 
+**Line editing keys also update hints:**
+- `Ctrl+U` - Kill entire line (clears hints)
+- `Ctrl+K` - Kill to end of line
+- `Ctrl+W` - Delete word backward
+- `Alt+D` - Delete word forward
+- `Backspace`/`Delete` - Remove characters
+
 ## How It Works
 
 1. **Command Parsing**: Extracts command name and flags from your input
-2. **Flag Lookup**: Searches `--help` output and man pages for descriptions
-3. **Data Store**: Saves per-command flag metadata in `~/.config/fish/shellock/data/` for fast subsequent lookups
-4. **Display**: Renders explanations below your prompt using ANSI escape codes
+2. **Flag Lookup**: Non-blocking check for command metadata
+   - If cached: instant display from `~/.config/fish/shellock/data/`
+   - If new command: shows "Learning \<command\>..." and scans in background
+3. **Background Scanning** (first use only): Spawns detached process to parse `--help` output and man pages
+4. **Data Store**: Saves per-command flag metadata with atomic writes for fast subsequent lookups
+5. **Display**: Renders explanations below your prompt using ANSI escape codes
+6. **Smart Truncation**: Long descriptions end at sentence/word boundaries, not mid-word
 
 ## CLI Tool
 

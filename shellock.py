@@ -30,6 +30,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -227,7 +228,39 @@ def load_command_data(*, command: str) -> dict | None:
 def save_command_data(*, command: str, data: dict) -> None:
     shellock_data_dir().mkdir(parents=True, exist_ok=True)
     path = command_data_path(command=command)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    # Atomic write: write to temp file then rename
+    temp_path = path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        temp_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        temp_path.rename(path)  # Atomic on POSIX
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def is_scan_in_progress(*, command: str) -> bool:
+    """Check if a background scan is already running for this command."""
+    lock_path = command_data_path(command=command).with_suffix(".scanning")
+    if not lock_path.exists():
+        return False
+    # Stale lock check (5 minute timeout)
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+        return age < 300
+    except FileNotFoundError:
+        return False
+
+
+def spawn_background_scan(*, command: str) -> None:
+    """Spawn a detached background process to scan a command."""
+    script_path = str(Path(__file__).resolve())
+    subprocess.Popen(
+        [script_path, "scan", command],
+        start_new_session=True,  # Detach from terminal
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def ensure_command_scanned(
@@ -449,6 +482,28 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
     )
 
 
+def truncate_description(text: str, max_length: int = 160) -> str:
+    """Truncate description at sentence or word boundary."""
+    if len(text) <= max_length:
+        return text
+
+    limit = max_length - 3  # Room for "..."
+    truncated = text[:limit]
+
+    # Try sentence boundary (. ! ?) followed by space
+    for punct in (". ", "! ", "? "):
+        pos = truncated.rfind(punct)
+        if pos > limit // 2:
+            return text[: pos + 1]
+
+    # Fall back to word boundary
+    last_space = truncated.rfind(" ")
+    if last_space > limit // 2:
+        return truncated[:last_space] + "..."
+
+    return truncated + "..."
+
+
 def strip_man_formatting(*, text: str) -> str:
     """
     Strip man page formatting (bold/underline via backspace sequences).
@@ -625,9 +680,7 @@ def parse_man_page(*, man_text: str) -> dict[str, str]:
                 # Found a flag line
                 # Save previous flag(s)
                 if current_flags and current_desc:
-                    desc = " ".join(current_desc).strip()
-                    if len(desc) > 160:
-                        desc = desc[:157] + "..."
+                    desc = truncate_description(" ".join(current_desc).strip())
                     for f in current_flags:
                         flags[f] = desc
 
@@ -671,9 +724,7 @@ def parse_man_page(*, man_text: str) -> dict[str, str]:
 
     # Save last flag(s)
     if current_flags and current_desc:
-        desc = " ".join(current_desc).strip()
-        if len(desc) > 160:
-            desc = desc[:157] + "..."
+        desc = truncate_description(" ".join(current_desc).strip())
         for f in current_flags:
             flags[f] = desc
 
@@ -836,14 +887,30 @@ def lookup_flag(
 def explain_command(
     *, protocol: CommandProtocol, cmdline: str
 ) -> list[FlagDescription]:
-    """Parse a command line and return descriptions for all flags."""
+    """Parse a command line and return descriptions for all flags.
+
+    Non-blocking: if command data doesn't exist, spawns a background scan
+    and returns a "Learning..." indicator instead of blocking.
+    """
     parsed = parse_command_line(cmdline=cmdline)
     if not parsed:
         return []
 
-    # Ensure command DB exists; on first encounter this eagerly scans subcommands too.
-    ensure_command_scanned(protocol=protocol, command=parsed.command, refresh=False)
+    # Non-blocking: check if data exists without triggering a scan
+    data = load_command_data(command=parsed.command)
 
+    if data is None:
+        # No data yet - spawn background scan if not already running
+        if not is_scan_in_progress(command=parsed.command):
+            spawn_background_scan(command=parsed.command)
+        # Return "Learning..." indicator
+        return [
+            FlagDescription(
+                flag="__scanning__", description=f"Learning {parsed.command}..."
+            )
+        ]
+
+    # Data exists - proceed with lookup
     results: list[FlagDescription] = []
     seen: set[str] = set()
 
@@ -852,8 +919,8 @@ def explain_command(
             continue
         seen.add(flag.name)
 
-        desc = lookup_flag(
-            protocol=protocol,
+        desc = lookup_flag_from_data(
+            data=data,
             command=parsed.command,
             flag=flag.name,
             subcommand=parsed.subcommand,
@@ -865,6 +932,36 @@ def explain_command(
     return results
 
 
+def lookup_flag_from_data(
+    *, data: dict, command: str, flag: str, subcommand: str | None = None
+) -> str | None:
+    """Look up flag description from already-loaded data (non-blocking)."""
+    if subcommand:
+        subcommand_data = data.get("subcommands", {}).get(subcommand, {})
+        if subcommand_data:
+            flags = subcommand_data.get("flags", {})
+            if flag in flags:
+                return flags[flag]
+        # Fall back to main command flags
+
+    flags = data.get("flags", {})
+    if flag in flags:
+        return flags[flag]
+
+    # Combined short flags: -rf => -r + -f
+    if re.match(r"^-[a-zA-Z]{2,}$", flag):
+        chars = flag[1:]
+        parts: list[str] = []
+        for char in chars:
+            single_flag = f"-{char}"
+            if single_flag in flags:
+                parts.append(f"{single_flag}: {flags[single_flag]}")
+        if parts:
+            return "Combination: " + " | ".join(parts)
+
+    return None
+
+
 def format_explanations(
     *,
     explanations: list[FlagDescription],
@@ -873,6 +970,12 @@ def format_explanations(
     """Format flag explanations for terminal display."""
     if not explanations:
         return ""
+
+    # Handle scanning indicator specially
+    if len(explanations) == 1 and explanations[0].flag == "__scanning__":
+        if use_color:
+            return f"{DIM}  {explanations[0].description}{RESET}"
+        return f"  {explanations[0].description}"
 
     lines: list[str] = []
     max_flag_len = max(len(e.flag) for e in explanations)
@@ -937,6 +1040,10 @@ def main() -> int:
     # refresh command (explicit)
     refresh_p = subparsers.add_parser("refresh", help="Refresh command data")
     refresh_p.add_argument("command", nargs="?", help="Command name")
+
+    # scan command (for background scanning)
+    scan_p = subparsers.add_parser("scan", help="Scan and cache command data")
+    scan_p.add_argument("command", help="Command to scan")
 
     args = parser.parse_args()
 
@@ -1010,6 +1117,19 @@ def main() -> int:
             print("Missing command for refresh", file=sys.stderr)
             return 2
         refresh_command(protocol=protocol, command=args.command)
+        return 0
+
+    elif args.action == "scan":
+        # Background scan with lock file to prevent duplicate scans
+        lock_path = command_data_path(command=args.command).with_suffix(".scanning")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            lock_path.touch()
+            ensure_command_scanned(
+                protocol=protocol, command=args.command, refresh=False
+            )
+        finally:
+            lock_path.unlink(missing_ok=True)
         return 0
 
     return 1
