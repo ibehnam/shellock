@@ -81,6 +81,45 @@ You can also use shellock directly:
 ~/.config/fish/functions/shellock.py -r -a
 ```
 
+## LLM-based Generation (optional)
+
+Shellock can also generate `data/<command>.json` using an external LLM agent (instead of the built-in regex parsers).
+
+Requirements:
+- `claude` CLI available on your PATH (Claude Code)
+
+Examples:
+
+```bash
+# Generate and cache JSON (also prints it)
+~/.config/fish/functions/shellock.py generate git --print
+
+# Use LLM scanning for background learning/refresh as well
+export SHELLOCK_SCAN_BACKEND=llm
+export SHELLOCK_LLM_MODEL=sonnet
+```
+
+Config file (required for customization):
+
+Shellock reads `~/.config/fish/shellock/config.json` for configuration. Example:
+
+```json
+{
+  "scan_backend": "llm",
+  "llm_model": "sonnet",
+  "llm_max_subcommands": 25,
+  "llm_max_doc_chars": 30000,
+  "llm_timeout_s": 180
+}
+```
+
+Defaults:
+- `scan_backend`: `llm` (LLM then regex fallback)
+- `llm_model`: `sonnet`
+- `llm_max_subcommands`: `25`
+- `llm_max_doc_chars`: `30000`
+- `llm_timeout_s`: `180`
+
 ## Data Storage
 
 Shellock stores durable command metadata in:

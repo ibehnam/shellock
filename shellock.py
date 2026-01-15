@@ -34,10 +34,272 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Final, Protocol, TypedDict
 
 # Constants
 PROTOCOL_VERSION: Final[int] = 1
+
+
+class Sources(TypedDict):
+    help: bool
+    man: bool
+
+
+class SubcommandData(TypedDict):
+    generated_at: str
+    sources: Sources
+    flags: dict[str, str]
+
+
+class CommandData(TypedDict):
+    protocol_version: int
+    command: str
+    generated_at: str
+    sources: Sources
+    flags: dict[str, str]
+    subcommands: dict[str, SubcommandData]
+
+
+def command_data_json_schema() -> dict:
+    """JSON Schema for the durable command metadata stored under `.../data/<cmd>.json`."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "protocol_version": {"type": "integer"},
+            "command": {"type": "string", "minLength": 1},
+            "generated_at": {"type": "string", "minLength": 1},
+            "sources": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "help": {"type": "boolean"},
+                    "man": {"type": "boolean"},
+                },
+                "required": ["help", "man"],
+            },
+            "flags": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+            "subcommands": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "generated_at": {"type": "string", "minLength": 1},
+                        "sources": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "help": {"type": "boolean"},
+                                "man": {"type": "boolean"},
+                            },
+                            "required": ["help", "man"],
+                        },
+                        "flags": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                        },
+                    },
+                    "required": ["generated_at", "sources", "flags"],
+                },
+            },
+        },
+        "required": [
+            "protocol_version",
+            "command",
+            "generated_at",
+            "sources",
+            "flags",
+            "subcommands",
+        ],
+    }
+
+
+def subcommand_data_json_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "generated_at": {"type": "string", "minLength": 1},
+            "sources": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "help": {"type": "boolean"},
+                    "man": {"type": "boolean"},
+                },
+                "required": ["help", "man"],
+            },
+            "flags": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+        },
+        "required": ["generated_at", "sources", "flags"],
+    }
+
+
+class LlmAgentError(RuntimeError):
+    pass
+
+
+class StructuredJsonAgent(Protocol):
+    def run_json(
+        self, *, prompt: str, json_schema: dict, timeout_s: int | None = None
+    ) -> object: ...
+
+
+def _parse_first_json_value(*, text: str) -> object:
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch not in "{[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        return value
+    raise ValueError("No JSON value found in agent output")
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeAgent:
+    model: str = "sonnet"
+    executable: str = "claude"
+
+    def run_json(
+        self, *, prompt: str, json_schema: dict, timeout_s: int | None = None
+    ) -> object:
+        schema_arg = json.dumps(json_schema, separators=(",", ":"), sort_keys=True)
+        cmd = [
+            self.executable,
+            "-p",
+            "--output-format",
+            "json",
+            "--no-session-persistence",
+            "--no-chrome",
+            "--disable-slash-commands",
+            "--tools",
+            "",
+            "--model",
+            self.model,
+            "--json-schema",
+            schema_arg,
+            prompt,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s or 120,
+            )
+        except FileNotFoundError as e:
+            raise LlmAgentError(
+                f"Agent executable not found: {self.executable}"
+            ) from e
+        except subprocess.TimeoutExpired as e:
+            raise LlmAgentError("Agent call timed out") from e
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            raise LlmAgentError(
+                f"Agent failed (exit {result.returncode}): {stderr or 'no stderr'}"
+            )
+
+        raw = (result.stdout or "").strip()
+        if not raw:
+            raise LlmAgentError("Agent returned empty output")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                return _parse_first_json_value(text=raw)
+            except ValueError as e:
+                raise LlmAgentError(
+                    f"Agent output was not valid JSON: {raw[:4000]}"
+                ) from e
+
+
+def _validate_sources(*, sources: object) -> Sources:
+    if not isinstance(sources, dict):
+        raise ValueError("sources must be an object")
+    help_ok = sources.get("help")
+    man_ok = sources.get("man")
+    if not isinstance(help_ok, bool) or not isinstance(man_ok, bool):
+        raise ValueError("sources.help and sources.man must be booleans")
+    return {"help": help_ok, "man": man_ok}
+
+
+def _validate_flags(*, flags: object) -> dict[str, str]:
+    if not isinstance(flags, dict):
+        raise ValueError("flags must be an object")
+    out: dict[str, str] = {}
+    for k, v in flags.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ValueError("flags must map strings to strings")
+        if not k:
+            continue
+        out[k] = v.strip()
+    return out
+
+
+def validate_command_data(*, payload: object, command: str) -> CommandData:
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    if payload.get("protocol_version") != PROTOCOL_VERSION:
+        raise ValueError("protocol_version mismatch")
+    if payload.get("command") != command:
+        raise ValueError("command mismatch")
+    generated_at = payload.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at:
+        raise ValueError("generated_at must be a non-empty string")
+
+    sources = _validate_sources(sources=payload.get("sources"))
+    flags = _validate_flags(flags=payload.get("flags"))
+
+    subcommands_raw = payload.get("subcommands")
+    if not isinstance(subcommands_raw, dict):
+        raise ValueError("subcommands must be an object")
+    subcommands: dict[str, SubcommandData] = {}
+    for sub_name, sub_payload in subcommands_raw.items():
+        if not isinstance(sub_name, str) or not sub_name:
+            raise ValueError("subcommand names must be non-empty strings")
+        if not isinstance(sub_payload, dict):
+            raise ValueError("subcommand payload must be an object")
+        sub_generated_at = sub_payload.get("generated_at")
+        if not isinstance(sub_generated_at, str) or not sub_generated_at:
+            raise ValueError("subcommand generated_at must be a non-empty string")
+        sub_sources = _validate_sources(sources=sub_payload.get("sources"))
+        sub_flags = _validate_flags(flags=sub_payload.get("flags"))
+        subcommands[sub_name] = {
+            "generated_at": sub_generated_at,
+            "sources": sub_sources,
+            "flags": sub_flags,
+        }
+
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "command": command,
+        "generated_at": generated_at,
+        "sources": sources,
+        "flags": flags,
+        "subcommands": subcommands,
+    }
+
+
+def validate_subcommand_data(*, payload: object) -> SubcommandData:
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    generated_at = payload.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at:
+        raise ValueError("generated_at must be a non-empty string")
+    sources = _validate_sources(sources=payload.get("sources"))
+    flags = _validate_flags(flags=payload.get("flags"))
+    return {"generated_at": generated_at, "sources": sources, "flags": flags}
 
 # ANSI colors for terminal output
 DIM: Final[str] = "\033[2m"
@@ -76,6 +338,27 @@ def shellock_home() -> Path:
 
 def shellock_data_dir() -> Path:
     return shellock_home() / "data"
+
+
+def shellock_config_path() -> Path:
+    return shellock_home() / "config.json"
+
+
+def _load_config() -> dict:
+    path = shellock_config_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _config_get(*, key: str) -> object | None:
+    return _load_config().get(key)
 
 
 def _command_file_name(command: str) -> str:
@@ -184,6 +467,228 @@ class HeuristicSubcommandDiscoverer:
         return discovered
 
 
+@dataclass(frozen=True, slots=True)
+class HelpAndMan:
+    help_text: str | None
+    man_text: str | None
+
+
+def _get_help_and_man(
+    *, protocol: CommandProtocol, command: str, subcommand: str | None
+) -> HelpAndMan:
+    return HelpAndMan(
+        help_text=protocol.help_provider.get_help_text(
+            command=command, subcommand=subcommand
+        ),
+        man_text=protocol.help_provider.get_man_text(
+            command=command, subcommand=subcommand
+        ),
+    )
+
+
+def _sources_from_docs(*, docs: HelpAndMan) -> Sources:
+    return {"help": bool(docs.help_text), "man": bool(docs.man_text)}
+
+
+def _primary_doc_text(*, docs: HelpAndMan) -> tuple[str, str] | None:
+    if docs.man_text:
+        return ("man", docs.man_text)
+    if docs.help_text:
+        return ("help", docs.help_text)
+    return None
+
+
+def _truncate_for_prompt(*, text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[... truncated ...]\n"
+
+
+def generate_command_data_llm(
+    *,
+    protocol: CommandProtocol,
+    agent: StructuredJsonAgent,
+    command: str,
+    max_subcommands: int,
+    max_doc_chars: int,
+    timeout_s: int,
+) -> CommandData:
+    """Generate and persist command JSON using an external LLM agent.
+
+    Priority: man page if present, otherwise help output.
+    """
+    root_docs = _get_help_and_man(protocol=protocol, command=command, subcommand=None)
+    root_primary = _primary_doc_text(docs=root_docs)
+    if root_primary is None:
+        raise LlmAgentError(f"No man page or help output found for: {command}")
+
+    discovered = sorted(
+        protocol.subcommands.discover(
+            command=command, help_text=root_docs.help_text, man_text=root_docs.man_text
+        )
+    )
+    subcommands = discovered[: max(0, max_subcommands)]
+
+    now = _utc_now_iso()
+
+    prompt_parts: list[str] = []
+    prompt_parts.append(
+        "\n".join(
+            [
+                "You are given documentation text for a CLI command and some of its subcommands.",
+                "Produce a single JSON value that matches the provided JSON Schema exactly.",
+                "",
+                "Extraction rules:",
+                "- Do not invent flags, subcommands, or descriptions.",
+                "- Only include options/flags (typically tokens that start with '-' or '--').",
+                "- Use the flag token only (omit argument placeholders like '<path>' or '=VALUE').",
+                "- Keep descriptions concise (ideally <= 160 chars).",
+                "",
+                f"Target command: {command}",
+                f"protocol_version must be: {PROTOCOL_VERSION}",
+                f"generated_at must be: {now}",
+                "",
+                "Fill `sources` booleans based on whether the docs are present (help/man).",
+                "Prefer man pages when both help and man are available.",
+                "",
+            ]
+        )
+    )
+
+    root_kind, root_text = root_primary
+    prompt_parts.append(f"== {command} ({root_kind}) ==")
+    prompt_parts.append(_truncate_for_prompt(text=root_text, max_chars=max_doc_chars))
+
+    sub_docs: dict[str, HelpAndMan] = {}
+    for sub in subcommands:
+        docs = _get_help_and_man(protocol=protocol, command=command, subcommand=sub)
+        primary = _primary_doc_text(docs=docs)
+        if primary is None:
+            continue
+        sub_docs[sub] = docs
+        kind, text = primary
+        prompt_parts.append(f"== {command} {sub} ({kind}) ==")
+        prompt_parts.append(_truncate_for_prompt(text=text, max_chars=max_doc_chars))
+
+    prompt = "\n".join(prompt_parts).strip() + "\n"
+
+    candidate = agent.run_json(
+        prompt=prompt,
+        json_schema=command_data_json_schema(),
+        timeout_s=timeout_s,
+    )
+
+    if not isinstance(candidate, dict):
+        raise LlmAgentError("Agent output was not a JSON object")
+
+    # Normalize/override non-LLM fields to ensure determinism.
+    candidate["protocol_version"] = PROTOCOL_VERSION
+    candidate["command"] = command
+    candidate["generated_at"] = now
+    candidate["sources"] = _sources_from_docs(docs=root_docs)
+
+    if not isinstance(candidate.get("flags"), dict):
+        candidate["flags"] = {}
+
+    raw_subs = candidate.get("subcommands")
+    if not isinstance(raw_subs, dict):
+        raw_subs = {}
+
+    normalized_subs: dict[str, dict] = {}
+    for sub in sub_docs.keys():
+        sub_payload = raw_subs.get(sub)
+        if not isinstance(sub_payload, dict):
+            sub_payload = {}
+        if not isinstance(sub_payload.get("flags"), dict):
+            sub_payload["flags"] = {}
+        sub_payload["generated_at"] = now
+        sub_payload["sources"] = _sources_from_docs(docs=sub_docs[sub])
+        normalized_subs[sub] = sub_payload
+
+    candidate["subcommands"] = normalized_subs
+
+    return validate_command_data(payload=candidate, command=command)
+
+
+def generate_subcommand_data_llm(
+    *,
+    protocol: CommandProtocol,
+    agent: StructuredJsonAgent,
+    command: str,
+    subcommand: str,
+    max_doc_chars: int,
+    timeout_s: int,
+) -> SubcommandData:
+    docs = _get_help_and_man(protocol=protocol, command=command, subcommand=subcommand)
+    primary = _primary_doc_text(docs=docs)
+    if primary is None:
+        raise LlmAgentError(
+            f"No man page or help output found for: {command} {subcommand}"
+        )
+    now = _utc_now_iso()
+    kind, text = primary
+    prompt = (
+        "\n".join(
+            [
+                "You are given documentation text for a CLI subcommand.",
+                "Produce a single JSON value that matches the provided JSON Schema exactly.",
+                "",
+                "Extraction rules:",
+                "- Do not invent flags or descriptions.",
+                "- Only include options/flags (typically tokens that start with '-' or '--').",
+                "- Use the flag token only (omit argument placeholders like '<path>' or '=VALUE').",
+                "- Keep descriptions concise (ideally <= 160 chars).",
+                "",
+                f"Target: {command} {subcommand}",
+                f"generated_at must be: {now}",
+                "",
+                f"== {command} {subcommand} ({kind}) ==",
+                _truncate_for_prompt(text=text, max_chars=max_doc_chars),
+            ]
+        ).strip()
+        + "\n"
+    )
+
+    candidate = agent.run_json(
+        prompt=prompt,
+        json_schema=subcommand_data_json_schema(),
+        timeout_s=timeout_s,
+    )
+
+    if not isinstance(candidate, dict):
+        raise LlmAgentError("Agent output was not a JSON object")
+
+    candidate["generated_at"] = now
+    candidate["sources"] = _sources_from_docs(docs=docs)
+    if not isinstance(candidate.get("flags"), dict):
+        candidate["flags"] = {}
+
+    return validate_subcommand_data(payload=candidate)
+
+
+def _scan_backend() -> str:
+    cfg = _config_get(key="scan_backend")
+    if isinstance(cfg, str) and cfg.strip():
+        return cfg.strip().lower()
+    return "llm"
+
+
+def _setting_int(*, config_key: str, default: int) -> int:
+    cfg = _config_get(key=config_key)
+    if cfg is None:
+        return default
+    try:
+        return int(cfg)
+    except (TypeError, ValueError):
+        return default
+
+
+def _llm_agent_from_env() -> StructuredJsonAgent:
+    cfg = _config_get(key="llm_model")
+    model = cfg.strip() if isinstance(cfg, str) and cfg.strip() else "sonnet"
+    return ClaudeCodeAgent(model=model)
+
+
 def _scan_flags_and_subcommands(
     *, protocol: CommandProtocol, command: str, subcommand: str | None
 ) -> ScanResult:
@@ -269,6 +774,32 @@ def ensure_command_scanned(
     data = load_command_data(command=command)
 
     if data is None or refresh:
+        backend = _scan_backend()
+        if backend in {"llm", "llm-only", "auto"}:
+            try:
+                llm_data = generate_command_data_llm(
+                    protocol=protocol,
+                    agent=_llm_agent_from_env(),
+                    command=command,
+                    max_subcommands=_setting_int(
+                        config_key="llm_max_subcommands",
+                        default=25,
+                    ),
+                    max_doc_chars=_setting_int(
+                        config_key="llm_max_doc_chars",
+                        default=30000,
+                    ),
+                    timeout_s=_setting_int(
+                        config_key="llm_timeout_s",
+                        default=180,
+                    ),
+                )
+                save_command_data(command=command, data=llm_data)
+                return llm_data
+            except LlmAgentError:
+                if backend == "llm-only":
+                    raise
+
         scan = _scan_flags_and_subcommands(
             protocol=protocol, command=command, subcommand=None
         )
@@ -305,14 +836,36 @@ def ensure_subcommand_scanned(
     subcommands = data.get("subcommands", {})
 
     if subcommand not in subcommands:
-        sub_scan = _scan_flags_and_subcommands(
-            protocol=protocol, command=command, subcommand=subcommand
-        )
-        subcommands[subcommand] = {
-            "generated_at": _utc_now_iso(),
-            "sources": sub_scan.sources,
-            "flags": sub_scan.flags,
-        }
+        backend = _scan_backend()
+        if backend in {"llm", "llm-only", "auto"}:
+            try:
+                sub_data = generate_subcommand_data_llm(
+                    protocol=protocol,
+                    agent=_llm_agent_from_env(),
+                    command=command,
+                    subcommand=subcommand,
+                    max_doc_chars=_setting_int(
+                        config_key="llm_max_doc_chars",
+                        default=30000,
+                    ),
+                    timeout_s=_setting_int(
+                        config_key="llm_timeout_s",
+                        default=180,
+                    ),
+                )
+                subcommands[subcommand] = sub_data
+            except LlmAgentError:
+                if backend == "llm-only":
+                    raise
+        if subcommand not in subcommands:
+            sub_scan = _scan_flags_and_subcommands(
+                protocol=protocol, command=command, subcommand=subcommand
+            )
+            subcommands[subcommand] = {
+                "generated_at": _utc_now_iso(),
+                "sources": sub_scan.sources,
+                "flags": sub_scan.flags,
+            }
         data["subcommands"] = subcommands
         save_command_data(command=command, data=data)
 
@@ -321,6 +874,32 @@ def ensure_subcommand_scanned(
 
 def refresh_command(*, protocol: CommandProtocol, command: str) -> None:
     existing = load_command_data(command=command) or {}
+
+    backend = _scan_backend()
+    if backend in {"llm", "llm-only", "auto"}:
+        try:
+            llm_data = generate_command_data_llm(
+                protocol=protocol,
+                agent=_llm_agent_from_env(),
+                command=command,
+                max_subcommands=_setting_int(
+                    config_key="llm_max_subcommands",
+                    default=25,
+                ),
+                max_doc_chars=_setting_int(
+                    config_key="llm_max_doc_chars",
+                    default=30000,
+                ),
+                timeout_s=_setting_int(
+                    config_key="llm_timeout_s",
+                    default=180,
+                ),
+            )
+            save_command_data(command=command, data=llm_data)
+            return
+        except LlmAgentError:
+            if backend == "llm-only":
+                raise
 
     scan = _scan_flags_and_subcommands(
         protocol=protocol, command=command, subcommand=None
@@ -1080,6 +1659,39 @@ def main() -> int:
     scan_p = subparsers.add_parser("scan", help="Scan and cache command data")
     scan_p.add_argument("command", help="Command to scan")
 
+    # generate command (LLM-based)
+    model_default = None
+    cfg = _config_get(key="llm_model")
+    if isinstance(cfg, str) and cfg.strip():
+        model_default = cfg.strip()
+    gen_p = subparsers.add_parser(
+        "generate",
+        help="Generate and cache command data using an LLM agent (prefers man pages)",
+    )
+    gen_p.add_argument("command", help="Command to generate data for")
+    gen_p.add_argument("--agent", default="claude", choices=["claude"])
+    gen_p.add_argument("--model", default=model_default or "sonnet")
+    gen_p.add_argument(
+        "--max-subcommands",
+        type=int,
+        default=_setting_int(config_key="llm_max_subcommands", default=25),
+    )
+    gen_p.add_argument(
+        "--max-doc-chars",
+        type=int,
+        default=_setting_int(config_key="llm_max_doc_chars", default=30000),
+    )
+    gen_p.add_argument(
+        "--timeout-s",
+        type=int,
+        default=_setting_int(config_key="llm_timeout_s", default=180),
+    )
+    gen_p.add_argument(
+        "--print",
+        action="store_true",
+        help="Print the generated JSON to stdout (also saves to data dir)",
+    )
+
     args = parser.parse_args()
 
     protocol = _default_protocol()
@@ -1165,6 +1777,25 @@ def main() -> int:
             )
         finally:
             lock_path.unlink(missing_ok=True)
+        return 0
+
+    elif args.action == "generate":
+        if args.agent != "claude":
+            print(f"Unsupported agent: {args.agent}", file=sys.stderr)
+            return 2
+
+        agent = ClaudeCodeAgent(model=args.model)
+        data = generate_command_data_llm(
+            protocol=protocol,
+            agent=agent,
+            command=args.command,
+            max_subcommands=max(0, args.max_subcommands),
+            max_doc_chars=max(1, args.max_doc_chars),
+            timeout_s=max(1, args.timeout_s),
+        )
+        save_command_data(command=args.command, data=data)
+        if args.print:
+            print(json.dumps(data, indent=2, sort_keys=True))
         return 0
 
     return 1
