@@ -8,3 +8,13 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.Icon?
+.claude
+.codex
+.opencode

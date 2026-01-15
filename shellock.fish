@@ -21,7 +21,7 @@ function __shellock_explain
     end
 
     # Get explanations from shellock
-    set -l shellock_path "$HOME/Downloads/shellock/shellock.py"
+    set -l shellock_path (dirname (status filename))/shellock.py
     if not test -x "$shellock_path"
         return
     end

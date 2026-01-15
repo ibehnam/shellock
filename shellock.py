@@ -3,34 +3,40 @@
 # requires-python = ">=3.13"
 # dependencies = []
 # ///
-"""
-Shellock - Real-time CLI flag explainer.
+"""Shellock - Real-time CLI flag explainer.
 
 Parses command-line flags and retrieves their descriptions from --help or man pages.
 Designed to integrate with fish shell for real-time explanations as you type.
 
+Storage model:
+- Durable command metadata lives under `~/.config/fish/shellock/data/`.
+- One JSON file per command (e.g. `git.json`) with nested subcommand data.
+- `SHELLOCK_HOME` environment variable overrides the storage location.
+
 Usage:
-    shellock parse "jq -r -s file.json"     # Parse flags from command
-    shellock lookup jq -r                    # Look up description for -r flag of jq
-    shellock explain "jq -r -s file.json"   # Parse and explain all flags
-    shellock clear-cache                     # Clear the flag description cache
+    shellock parse "jq -r -s file.json"           # Parse flags from command
+    shellock lookup jq -r                          # Look up description for -r flag of jq
+    shellock explain "jq -r -s file.json"         # Parse and explain all flags
+    shellock -r tree                               # Refresh `tree` (command + subcommands)
+    shellock -r -a                                 # Refresh all known commands
 """
+
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final
+from typing import Final, Protocol
 
 # Constants
-CACHE_DIR: Final[Path] = Path.home() / ".cache" / "shellock"
-CACHE_TTL_DAYS: Final[int] = 30
+PROTOCOL_VERSION: Final[int] = 1
 
 # ANSI colors for terminal output
 DIM: Final[str] = "\033[2m"
@@ -39,13 +45,293 @@ CYAN: Final[str] = "\033[36m"
 
 # Command-specific help overrides
 # Some commands need special help invocations to show all flags
-HELP_SOURCE_OVERRIDES: Final[dict[str, list[str] | callable]] = {
+HELP_SOURCE_OVERRIDES: Final[dict[str, object]] = {
     "curl": ["curl", "--help", "all"],
     "git": lambda subcmd: ["git", "help", subcmd] if subcmd else ["git", "-h"],
-    "docker": lambda subcmd: ["docker", subcmd, "--help"] if subcmd else ["docker", "--help"],
-    "kubectl": lambda subcmd: ["kubectl", subcmd, "--help"] if subcmd else ["kubectl", "--help"],
+    "docker": lambda subcmd: ["docker", subcmd, "--help"]
+    if subcmd
+    else ["docker", "--help"],
+    "kubectl": lambda subcmd: ["kubectl", subcmd, "--help"]
+    if subcmd
+    else ["kubectl", "--help"],
     "npm": lambda subcmd: ["npm", subcmd, "--help"] if subcmd else ["npm", "--help"],
 }
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def shellock_home() -> Path:
+    """Return Shellock's home directory.
+
+    Defaults to `~/.config/fish/shellock`, overridable via `SHELLOCK_HOME`.
+    """
+    raw = os.environ.get("SHELLOCK_HOME")
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".config" / "fish" / "shellock"
+
+
+def shellock_data_dir() -> Path:
+    return shellock_home() / "data"
+
+
+def _command_file_name(command: str) -> str:
+    """Use the command token as the name, sanitized for filesystem."""
+    safe = command.replace("/", "_").replace("\\", "_")
+    safe = safe.replace(":", "_")
+    safe = re.sub(r"\s+", "_", safe)
+    return safe
+
+
+def command_data_path(*, command: str) -> Path:
+    return shellock_data_dir() / f"{_command_file_name(command)}.json"
+
+
+class HelpProvider(Protocol):
+    def get_help_text(self, *, command: str, subcommand: str | None) -> str | None: ...
+
+    def get_man_text(self, *, command: str, subcommand: str | None) -> str | None: ...
+
+
+class FlagExtractor(Protocol):
+    def extract_from_help(self, *, help_text: str) -> dict[str, str]: ...
+
+    def extract_from_man(self, *, man_text: str) -> dict[str, str]: ...
+
+
+class SubcommandDiscoverer(Protocol):
+    def discover(
+        self, *, command: str, help_text: str | None, man_text: str | None
+    ) -> set[str]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ScanResult:
+    flags: dict[str, str]
+    sources: dict[str, bool]
+    discovered_subcommands: set[str]
+
+
+@dataclass(frozen=True, slots=True)
+class CommandProtocol:
+    help_provider: HelpProvider
+    extractor: FlagExtractor
+    subcommands: SubcommandDiscoverer
+
+
+class DefaultHelpProvider:
+    def get_help_text(self, *, command: str, subcommand: str | None) -> str | None:
+        return get_help_text(command=command, subcommand=subcommand)
+
+    def get_man_text(self, *, command: str, subcommand: str | None) -> str | None:
+        return get_man_text(command=command, subcommand=subcommand)
+
+
+class RegexExtractor:
+    def extract_from_help(self, *, help_text: str) -> dict[str, str]:
+        return parse_help_output(help_text=help_text)
+
+    def extract_from_man(self, *, man_text: str) -> dict[str, str]:
+        return parse_man_page(man_text=man_text)
+
+
+class HeuristicSubcommandDiscoverer:
+    _section_markers = re.compile(
+        r"(?im)^\s*(commands|available commands|subcommands)\s*:?:\s*$"
+    )
+
+    def discover(
+        self, *, command: str, help_text: str | None, man_text: str | None
+    ) -> set[str]:
+        text = "\n".join([t for t in [help_text, man_text] if t])
+        if not text:
+            return set()
+
+        discovered: set[str] = set()
+
+        list_entry = re.compile(r"^\s{2,}([a-z0-9][a-z0-9-]*)\s{2,}.*$", re.IGNORECASE)
+
+        in_section = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                if in_section:
+                    continue
+                continue
+
+            if self._section_markers.match(line):
+                in_section = True
+                continue
+
+            if in_section and re.match(r"^[A-Z][A-Z0-9 _-]+$", stripped):
+                in_section = False
+                continue
+
+            match = list_entry.match(line)
+            if match:
+                token = match.group(1)
+                if token.startswith("-"):
+                    continue
+                if token in {"options", "usage", "help"}:
+                    continue
+                if token == command:
+                    continue
+                discovered.add(token)
+
+        return discovered
+
+
+def _scan_flags_and_subcommands(
+    *, protocol: CommandProtocol, command: str, subcommand: str | None
+) -> ScanResult:
+    help_text = protocol.help_provider.get_help_text(
+        command=command, subcommand=subcommand
+    )
+    man_text = protocol.help_provider.get_man_text(
+        command=command, subcommand=subcommand
+    )
+
+    flags: dict[str, str] = {}
+    sources = {"help": False, "man": False}
+
+    if help_text:
+        sources["help"] = True
+        flags.update(protocol.extractor.extract_from_help(help_text=help_text))
+
+    if man_text:
+        sources["man"] = True
+        for k, v in protocol.extractor.extract_from_man(man_text=man_text).items():
+            flags.setdefault(k, v)
+
+    discovered_subcommands = protocol.subcommands.discover(
+        command=command, help_text=help_text, man_text=man_text
+    )
+
+    return ScanResult(
+        flags=flags, sources=sources, discovered_subcommands=discovered_subcommands
+    )
+
+
+def load_command_data(*, command: str) -> dict | None:
+    path = command_data_path(command=command)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def save_command_data(*, command: str, data: dict) -> None:
+    shellock_data_dir().mkdir(parents=True, exist_ok=True)
+    path = command_data_path(command=command)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def ensure_command_scanned(
+    *, protocol: CommandProtocol, command: str, refresh: bool
+) -> dict:
+    data = load_command_data(command=command)
+
+    if data is None or refresh:
+        scan = _scan_flags_and_subcommands(
+            protocol=protocol, command=command, subcommand=None
+        )
+        subcommands: dict[str, dict] = {}
+
+        for sub in sorted(scan.discovered_subcommands):
+            sub_scan = _scan_flags_and_subcommands(
+                protocol=protocol, command=command, subcommand=sub
+            )
+            subcommands[sub] = {
+                "generated_at": _utc_now_iso(),
+                "sources": sub_scan.sources,
+                "flags": sub_scan.flags,
+            }
+
+        data = {
+            "protocol_version": PROTOCOL_VERSION,
+            "command": command,
+            "generated_at": _utc_now_iso(),
+            "sources": scan.sources,
+            "flags": scan.flags,
+            "subcommands": subcommands,
+        }
+        save_command_data(command=command, data=data)
+        return data
+
+    return data
+
+
+def ensure_subcommand_scanned(
+    *, protocol: CommandProtocol, command: str, subcommand: str
+) -> dict:
+    data = ensure_command_scanned(protocol=protocol, command=command, refresh=False)
+    subcommands = data.get("subcommands", {})
+
+    if subcommand not in subcommands:
+        sub_scan = _scan_flags_and_subcommands(
+            protocol=protocol, command=command, subcommand=subcommand
+        )
+        subcommands[subcommand] = {
+            "generated_at": _utc_now_iso(),
+            "sources": sub_scan.sources,
+            "flags": sub_scan.flags,
+        }
+        data["subcommands"] = subcommands
+        save_command_data(command=command, data=data)
+
+    return data
+
+
+def refresh_command(*, protocol: CommandProtocol, command: str) -> None:
+    existing = load_command_data(command=command) or {}
+
+    scan = _scan_flags_and_subcommands(
+        protocol=protocol, command=command, subcommand=None
+    )
+
+    recorded_subs = set((existing.get("subcommands") or {}).keys())
+    discovered_subs = set(scan.discovered_subcommands)
+    all_subs = sorted(recorded_subs | discovered_subs)
+
+    subcommands: dict[str, dict] = {}
+    for sub in all_subs:
+        sub_scan = _scan_flags_and_subcommands(
+            protocol=protocol, command=command, subcommand=sub
+        )
+        subcommands[sub] = {
+            "generated_at": _utc_now_iso(),
+            "sources": sub_scan.sources,
+            "flags": sub_scan.flags,
+        }
+
+    data = {
+        "protocol_version": PROTOCOL_VERSION,
+        "command": command,
+        "generated_at": _utc_now_iso(),
+        "sources": scan.sources,
+        "flags": scan.flags,
+        "subcommands": subcommands,
+    }
+
+    save_command_data(command=command, data=data)
+
+
+def refresh_all(*, protocol: CommandProtocol) -> None:
+    data_dir = shellock_data_dir()
+    if not data_dir.exists():
+        return
+    for path in sorted(data_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            continue
+        cmd = payload.get("command")
+        if isinstance(cmd, str) and cmd:
+            refresh_command(protocol=protocol, command=cmd)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +382,16 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
     subcommand: str | None = None
 
     # Known commands with subcommands
-    subcommand_commands = {"git", "docker", "kubectl", "npm", "cargo", "go", "pip", "uv"}
+    subcommand_commands = {
+        "git",
+        "docker",
+        "kubectl",
+        "npm",
+        "cargo",
+        "go",
+        "pip",
+        "uv",
+    }
 
     i = 1
     skip_next = False  # Track if next token is a flag value
@@ -152,45 +447,6 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
         flags=tuple(flags),
         subcommand=subcommand,
     )
-
-
-def get_cache_path(*, command: str, subcommand: str | None = None) -> Path:
-    """Get the cache file path for a command."""
-    key = f"{command}:{subcommand or ''}"
-    cache_hash = hashlib.md5(key.encode()).hexdigest()[:12]
-    return CACHE_DIR / f"{command}-{cache_hash}.json"
-
-
-def load_cache(*, command: str, subcommand: str | None = None) -> dict[str, str] | None:
-    """Load cached flag descriptions for a command."""
-    cache_path = get_cache_path(command=command, subcommand=subcommand)
-
-    if not cache_path.exists():
-        return None
-
-    try:
-        data = json.loads(cache_path.read_text())
-        return data.get("flags", {})
-    except (json.JSONDecodeError, KeyError):
-        return None
-
-
-def save_cache(
-    *,
-    command: str,
-    subcommand: str | None = None,
-    flags: dict[str, str],
-) -> None:
-    """Save flag descriptions to cache."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = get_cache_path(command=command, subcommand=subcommand)
-
-    data = {
-        "command": command,
-        "subcommand": subcommand,
-        "flags": flags,
-    }
-    cache_path.write_text(json.dumps(data, indent=2))
 
 
 def strip_man_formatting(*, text: str) -> str:
@@ -434,24 +690,27 @@ def get_help_text(*, command: str, subcommand: str | None = None) -> str | None:
     # Check for command-specific help overrides
     if command in HELP_SOURCE_OVERRIDES:
         help_source = HELP_SOURCE_OVERRIDES[command]
-        # Handle callable (for commands that need subcommand handling)
-        if callable(help_source):
-            cmd = help_source(subcommand)
-        else:
+        cmd: list[str] | None = None
+        if isinstance(help_source, list):
             cmd = help_source.copy()
+        elif callable(help_source):
+            maybe = help_source(subcommand)
+            if isinstance(maybe, list):
+                cmd = maybe
 
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            output = result.stdout or result.stderr
-            if output and len(output) > 50 and "-" in output:
-                return output
-        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
-            pass
+        if cmd is not None:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                output = result.stdout or result.stderr
+                if output and len(output) > 50 and "-" in output:
+                    return output
+            except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
+                pass
 
     # Fall back to standard help options
     base_cmd = [command]
@@ -504,7 +763,12 @@ def get_man_text(*, command: str, subcommand: str | None = None) -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
-            env={**os.environ, "MANPAGER": "cat", "PAGER": "cat", "MAN_KEEP_FORMATTING": ""},
+            env={
+                **os.environ,
+                "MANPAGER": "cat",
+                "PAGER": "cat",
+                "MAN_KEEP_FORMATTING": "",
+            },
         )
         if result.returncode == 0 and result.stdout:
             return result.stdout
@@ -529,70 +793,56 @@ def get_man_text(*, command: str, subcommand: str | None = None) -> str | None:
 
 
 def lookup_flag(
-    *,
-    command: str,
-    flag: str,
-    subcommand: str | None = None,
+    *, protocol: CommandProtocol, command: str, flag: str, subcommand: str | None = None
 ) -> str | None:
+    """Look up the description for a specific flag.
+
+    - Ensures durable JSON exists under `~/.config/fish/shellock/data/`.
+    - Falls back from `(command, subcommand)` to `(command)` when needed.
+    - Supports combined short flags (e.g., `-rf`).
     """
-    Look up the description for a specific flag.
+    if subcommand is None:
+        data = ensure_command_scanned(protocol=protocol, command=command, refresh=False)
+        flags = data.get("flags", {})
+    else:
+        data = ensure_subcommand_scanned(
+            protocol=protocol, command=command, subcommand=subcommand
+        )
+        flags = (data.get("subcommands", {}).get(subcommand, {}) or {}).get("flags", {})
 
-    Checks cache first, then --help, then man page.
-    If not found in subcommand context, falls back to parent command.
-    """
-    # Check cache
-    cached = load_cache(command=command, subcommand=subcommand)
-    if cached and flag in cached:
-        return cached[flag]
+    if flag in flags:
+        return flags[flag]
 
-    # Get and parse help
-    all_flags: dict[str, str] = {}
+    if subcommand is not None:
+        # fall back to parent command
+        return lookup_flag(
+            protocol=protocol, command=command, flag=flag, subcommand=None
+        )
 
-    help_text = get_help_text(command=command, subcommand=subcommand)
-    if help_text:
-        all_flags.update(parse_help_output(help_text=help_text))
-
-    # Try man page if flag not found in help
-    if flag not in all_flags:
-        man_text = get_man_text(command=command, subcommand=subcommand)
-        if man_text:
-            all_flags.update(parse_man_page(man_text=man_text))
-
-    # Save to cache
-    if all_flags:
-        save_cache(command=command, subcommand=subcommand, flags=all_flags)
-
-    # If flag not found and we were looking in a subcommand context,
-    # fall back to the parent command (e.g., git -c is a git-level flag, not git-status)
-    if flag not in all_flags and subcommand is not None:
-        return lookup_flag(command=command, flag=flag, subcommand=None)
-
-    # If flag not found, check if it's a combination of short flags
-    # (e.g., -xf = -x + -f, -rf = -r + -f), but not --long-flags
-    if flag not in all_flags and re.match(r"^-[a-zA-Z]{2,}$", flag):
-        # Extract individual short flags (skip the leading dash)
+    # Combined short flags: -rf => -r + -f
+    if re.match(r"^-[a-zA-Z]{2,}$", flag):
         chars = flag[1:]
-        descriptions: list[str] = []
+        parts: list[str] = []
         for char in chars:
-            if char.isalpha():
-                single_flag = f"-{char}"
-                if single_flag in all_flags:
-                    descriptions.append(f"{single_flag}: {all_flags[single_flag]}")
+            single_flag = f"-{char}"
+            if single_flag in flags:
+                parts.append(f"{single_flag}: {flags[single_flag]}")
+        if parts:
+            return "Combination: " + " | ".join(parts)
 
-        if descriptions:
-            # Return combined description
-            return "Combination: " + " | ".join(descriptions)
-
-    return all_flags.get(flag)
+    return None
 
 
-def explain_command(*, cmdline: str) -> list[FlagDescription]:
-    """
-    Parse a command line and return descriptions for all flags.
-    """
+def explain_command(
+    *, protocol: CommandProtocol, cmdline: str
+) -> list[FlagDescription]:
+    """Parse a command line and return descriptions for all flags."""
     parsed = parse_command_line(cmdline=cmdline)
     if not parsed:
         return []
+
+    # Ensure command DB exists; on first encounter this eagerly scans subcommands too.
+    ensure_command_scanned(protocol=protocol, command=parsed.command, refresh=False)
 
     results: list[FlagDescription] = []
     seen: set[str] = set()
@@ -603,15 +853,13 @@ def explain_command(*, cmdline: str) -> list[FlagDescription]:
         seen.add(flag.name)
 
         desc = lookup_flag(
+            protocol=protocol,
             command=parsed.command,
             flag=flag.name,
             subcommand=parsed.subcommand,
         )
         results.append(
-            FlagDescription(
-                flag=flag.name,
-                description=desc or "Unknown flag",
-            )
+            FlagDescription(flag=flag.name, description=desc or "Unknown flag")
         )
 
     return results
@@ -632,24 +880,21 @@ def format_explanations(
     for exp in explanations:
         flag_padded = exp.flag.ljust(max_flag_len)
         if use_color:
-            lines.append(f"{DIM}  {CYAN}{flag_padded}{RESET}  {DIM}{exp.description}{RESET}")
+            lines.append(
+                f"{DIM}  {CYAN}{flag_padded}{RESET}  {DIM}{exp.description}{RESET}"
+            )
         else:
             lines.append(f"  {flag_padded}  {exp.description}")
 
     return "\n".join(lines)
 
 
-def clear_cache() -> int:
-    """Clear all cached flag descriptions."""
-    if CACHE_DIR.exists():
-        count = 0
-        for f in CACHE_DIR.glob("*.json"):
-            f.unlink()
-            count += 1
-        print(f"Cleared {count} cached entries")
-    else:
-        print("Cache directory does not exist")
-    return 0
+def _default_protocol() -> CommandProtocol:
+    return CommandProtocol(
+        help_provider=DefaultHelpProvider(),
+        extractor=RegexExtractor(),
+        subcommands=HeuristicSubcommandDiscoverer(),
+    )
 
 
 def main() -> int:
@@ -658,7 +903,21 @@ def main() -> int:
         description="Real-time CLI flag explainer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="action", required=True)
+    parser.add_argument(
+        "-r",
+        "--refresh",
+        nargs="?",
+        const="__prompt__",
+        help="Refresh command data (use with a command or with -a/--all)",
+    )
+    parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="With --refresh, refresh all known commands",
+    )
+
+    subparsers = parser.add_subparsers(dest="action")
 
     # parse command
     parse_p = subparsers.add_parser("parse", help="Parse flags from command line")
@@ -675,25 +934,54 @@ def main() -> int:
     explain_p.add_argument("cmdline", help="Command line to explain")
     explain_p.add_argument("--no-color", action="store_true", help="Disable colors")
 
-    # clear-cache command
-    subparsers.add_parser("clear-cache", help="Clear the flag cache")
+    # refresh command (explicit)
+    refresh_p = subparsers.add_parser("refresh", help="Refresh command data")
+    refresh_p.add_argument("command", nargs="?", help="Command name")
 
     args = parser.parse_args()
+
+    protocol = _default_protocol()
+
+    # Handle top-level refresh convenience flags:
+    #   shellock -r tree
+    #   shellock -r -a
+    if args.refresh is not None:
+        if args.all:
+            refresh_all(protocol=protocol)
+            return 0
+
+        if args.refresh == "__prompt__":
+            print("Missing command for --refresh", file=sys.stderr)
+            return 2
+
+        refresh_command(protocol=protocol, command=args.refresh)
+        return 0
+
+    if args.action is None:
+        parser.print_usage(sys.stderr)
+        return 2
 
     if args.action == "parse":
         result = parse_command_line(cmdline=args.cmdline)
         if result:
-            print(json.dumps({
-                "command": result.command,
-                "subcommand": result.subcommand,
-                "flags": [{"name": f.name, "is_long": f.is_long} for f in result.flags],
-            }))
+            print(
+                json.dumps(
+                    {
+                        "command": result.command,
+                        "subcommand": result.subcommand,
+                        "flags": [
+                            {"name": f.name, "is_long": f.is_long} for f in result.flags
+                        ],
+                    }
+                )
+            )
         else:
             print("{}")
         return 0
 
     elif args.action == "lookup":
         desc = lookup_flag(
+            protocol=protocol,
             command=args.command,
             flag=args.flag,
             subcommand=args.subcommand,
@@ -706,17 +994,23 @@ def main() -> int:
             return 1
 
     elif args.action == "explain":
-        explanations = explain_command(cmdline=args.cmdline)
+        explanations = explain_command(protocol=protocol, cmdline=args.cmdline)
         output = format_explanations(
-            explanations=explanations,
-            use_color=not args.no_color,
+            explanations=explanations, use_color=not args.no_color
         )
         if output:
             print(output)
         return 0
 
-    elif args.action == "clear-cache":
-        return clear_cache()
+    elif args.action == "refresh":
+        if args.all:
+            refresh_all(protocol=protocol)
+            return 0
+        if not args.command:
+            print("Missing command for refresh", file=sys.stderr)
+            return 2
+        refresh_command(protocol=protocol, command=args.command)
+        return 0
 
     return 1
 

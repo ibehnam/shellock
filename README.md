@@ -24,9 +24,9 @@ curl -fsSL https://raw.githubusercontent.com/ibehnam/shellock/main/install-curl.
 ### Clone and install
 
 ```fish
-# Clone to your preferred location (e.g., ~/.local/share/shellock)
-git clone https://github.com/ibehnam/shellock.git ~/.local/share/shellock
-cd ~/.local/share/shellock
+# Clone to your preferred location
+git clone https://github.com/ibehnam/shellock.git ~/downloads/shellock
+cd ~/downloads/shellock
 fish install.fish
 ```
 
@@ -44,28 +44,39 @@ After installation, explanations appear automatically as you type:
 
 1. **Command Parsing**: Extracts command name and flags from your input
 2. **Flag Lookup**: Searches `--help` output and man pages for descriptions
-3. **Caching**: Caches results in `~/.cache/shellock/` for fast subsequent lookups
+3. **Data Store**: Saves per-command flag metadata in `~/.config/fish/shellock/data/` for fast subsequent lookups
 4. **Display**: Renders explanations below your prompt using ANSI escape codes
 
 ## CLI Tool
 
-You can also use shellock directly from its directory:
+You can also use shellock directly:
 
 ```bash
-# From the shellock directory
-./shellock.py explain "git commit -am 'message'"
+# From the installation directory
+~/.config/fish/functions/shellock.py explain "git commit -am 'message'"
 
-# Or use the full path to shellock.py
-/path/to/shellock/shellock.py lookup git -m --subcommand commit
+# Or use the full path
+~/.config/fish/functions/shellock.py lookup git -m --subcommand commit
 
 # Parse command structure (JSON output)
-./shellock.py parse "rsync -avz src/ dest/"
+~/.config/fish/functions/shellock.py parse "rsync -avz src/ dest/"
 
-# Clear cache
-./shellock.py clear-cache
+# Refresh a command
+~/.config/fish/functions/shellock.py -r git
 
-# For fish shell integration, make sure to run the installer
+# Refresh everything
+~/.config/fish/functions/shellock.py -r -a
 ```
+
+## Data Storage
+
+Shellock stores durable command metadata in:
+
+```
+~/.config/fish/shellock/data/
+```
+
+You can override this location with `SHELLOCK_HOME`.
 
 ## Supported Formats
 
@@ -85,13 +96,18 @@ Shellock parses various man page formats:
 
 ## Files
 
+Shellock installs to the standard fish functions directory:
+
 ```
-shellock/
-├── shellock.py          # Main Python script
-├── shellock.fish        # Fish shell functions
-├── shellock_bindings.fish # Key bindings (symlinked to ~/.config/fish/conf.d/)
-├── install.fish         # Installer script
-└── README.md            # This file
+~/.config/fish/
+├── functions/
+│   ├── shellock.py              # Main Python script
+│   ├── shellock.fish            # Fish shell functions
+│   └── shellock_bindings.fish   # Key bindings
+├── conf.d/
+│   └── shellock_bindings.fish   # Symlink for auto-loading
+└── shellock/
+    └── data/                    # Durable command metadata
 ```
 
 ## Requirements

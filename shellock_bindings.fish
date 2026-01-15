@@ -2,7 +2,7 @@
 # Place in ~/.config/fish/conf.d/ or source from config.fish
 
 # Load the main shellock functions
-source "$HOME/Downloads/shellock/shellock.fish"
+source (dirname (realpath (status filename)))/shellock.fish
 
 # Bind dash key to trigger explanation
 # Works in both insert and default modes
