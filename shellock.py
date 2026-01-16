@@ -187,7 +187,7 @@ def _parse_first_json_value(*, text: str) -> object:
 class ClaudeCodeAgent:
     model: str = "sonnet"
     # executable: str = "claude"
-    executable: str = "ccs ghcp"
+    executable: str = "ccs glm"
 
     def run_json(
         self, *, prompt: str, json_schema: dict, timeout_s: int | None = None
@@ -390,9 +390,7 @@ CYAN: Final[str] = "\033[36m"
 # Some commands need special help invocations to show all flags
 HELP_SOURCE_OVERRIDES: Final[dict[str, object]] = {
     "curl": ["curl", "--help", "all"],
-    "git": lambda subcmds: (
-        ["git", *subcmds, "-h"] if subcmds else ["git", "-h"]
-    ),
+    "git": lambda subcmds: (["git", *subcmds, "-h"] if subcmds else ["git", "-h"]),
     "docker": lambda subcmds: (
         ["docker", *subcmds, "--help"] if subcmds else ["docker", "--help"]
     ),
@@ -688,12 +686,18 @@ def _llm_extract_node_data(
     used_docs = _docs_for_scan(docs=docs)
     primary = _primary_doc_text(docs=docs)
     if primary is None:
-        target = command if not subcommand else f"{command} {_subcommand_path_label(subcommand)}"
+        target = (
+            command
+            if not subcommand
+            else f"{command} {_subcommand_path_label(subcommand)}"
+        )
         raise LlmAgentError(f"No man page or help output found for: {target}")
 
     now = _utc_now_iso()
     kind, text = primary
-    target = command if not subcommand else f"{command} {_subcommand_path_label(subcommand)}"
+    target = (
+        command if not subcommand else f"{command} {_subcommand_path_label(subcommand)}"
+    )
     header = "CLI command" if not subcommand else "CLI subcommand"
     prompt = (
         "\n".join(
@@ -1893,7 +1897,9 @@ def explain_command(
     trailing_space = cmdline != cmdline.rstrip()
     command_only = len(tokens) == 1
     has_flag_token = any(tok.startswith("-") for tok in tokens[1:])
-    wants_scan = bool(parsed.flags) or (trailing_space and command_only) or has_flag_token
+    wants_scan = (
+        bool(parsed.flags) or (trailing_space and command_only) or has_flag_token
+    )
 
     # Non-blocking: check if data exists without triggering a scan
     data = load_command_data(command=parsed.command)
@@ -2169,7 +2175,9 @@ def main() -> int:
         result = parse_command_line(cmdline=args.cmdline)
         if result:
             subcommand_path = list(result.subcommands)
-            subcommand_label = " ".join(result.subcommands) if result.subcommands else None
+            subcommand_label = (
+                " ".join(result.subcommands) if result.subcommands else None
+            )
             print(
                 json.dumps(
                     {
