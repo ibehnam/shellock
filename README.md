@@ -59,7 +59,11 @@ After installation, explanations appear automatically as you type:
 2. **Flag Lookup**: Non-blocking check for command metadata
    - If cached: instant display from `~/.config/fish/shellock/data/`
    - If new command: shows "Learning \<command\>..." and scans in background
-3. **Background Scanning** (first use only): Spawns detached process to parse `--help` output and man pages
+3. **Background Scanning** (first use only): Uses LLM to extract flags and subcommands
+   - Reads `command --help` and asks LLM to extract both flags and subcommand names
+   - For each discovered subcommand, recursively scans `command subcommand --help` (in parallel)
+   - Continues until max depth (default: 3 levels) or no subcommands found
+   - Spawns detached process so fish remains responsive
 4. **Data Store**: Saves per-command flag metadata with atomic writes for fast subsequent lookups
 5. **Display**: Renders explanations below your prompt using ANSI escape codes
    - **Text Wrapping**: Long descriptions wrap at 80 chars on word boundaries, with continuation lines indented
@@ -87,46 +91,75 @@ You can also use shellock directly:
 ~/.config/fish/functions/shellock.py -r -a
 ```
 
-## LLM-based Generation (optional)
+## LLM-based Extraction
 
-Shellock can also generate `data/<command>.json` using an external LLM agent (instead of the built-in regex parsers).
+Shellock uses an LLM to extract flag descriptions and discover subcommands from help output.
 
-Requirements:
-- `claude` CLI available on your PATH (Claude Code)
+**Requirements:**
+- **`ccs`** or **`claude`** CLI must be installed and available on your PATH
+  - Install Claude Code: https://claude.com/code
+  - `ccs` is the Claude Code Shortcuts CLI (comes with Claude Code)
+  - `claude` is the main Claude Code CLI
 
-Examples:
+**Proxy Configuration:**
 
-	```bash
-	# Generate and cache JSON (also prints it)
-	~/.config/fish/functions/shellock.py generate git --print
-	
-	# Use LLM scanning for background learning/refresh as well
-	export SHELLOCK_SCAN_BACKEND=llm
-	export SHELLOCK_LLM_MODEL=sonnet
-	```
-	
-	Config file (optional, only if you want to customize defaults):
-	
-	Shellock reads `~/.config/fish/shellock/config.json` for configuration. Example:
+By default, Shellock uses a working proxy setup via `ccs glm` to leverage alternative LLM models. This is configured in `shellock.py`:
 
-	```json
-	{
-	  "scan_backend": "llm",
-	  "doc_order": ["help", "man"],
-	  "llm_model": "sonnet",
-	  "llm_max_subcommands": 25,
-	  "llm_max_doc_chars": 30000,
-	  "llm_timeout_s": 180
-	}
-	```
+```python
+@dataclass(frozen=True, slots=True)
+class ClaudeCodeAgent:
+    model: str = "sonnet"
+    executable: str = "ccs glm"  # Using GLM proxy via ccs
+```
 
-	Defaults:
-	- `scan_backend`: `llm` (LLM then regex fallback)
-	- `doc_order`: `["help", "man"]` (scan `help` first, fall back to `man` only if missing)
-	- `llm_model`: `sonnet`
-	- `llm_max_subcommands`: `25`
-	- `llm_max_doc_chars`: `30000`
-	- `llm_timeout_s`: `180`
+**To use standard Claude Code (no proxy):**
+
+Edit `shellock.py` line 260 and change:
+```python
+executable: str = "ccs glm"
+```
+to:
+```python
+executable: str = "claude"
+```
+
+**To use your own proxy:**
+
+Change the `executable` to your proxy command (e.g., `"ccs gemini"`, `"my-llm-proxy"`). The proxy must:
+- Accept `--output-format json` flag
+- Return structured output in the Claude Code JSON event format
+- Support `--json-schema` for structured extraction
+
+**Configuration:**
+
+Shellock reads `~/.config/fish/shellock/config.json` for configuration. Example:
+
+```json
+{
+  "max_subcommand_depth": 3,
+  "llm_model": "sonnet",
+  "llm_max_subcommands": 25,
+  "llm_max_doc_chars": 30000,
+  "llm_timeout_s": 180
+}
+```
+
+**Defaults:**
+- `max_subcommand_depth`: `3` (how deep to recursively scan subcommands)
+- `llm_model`: `sonnet` (can be `opus`, `sonnet`, or `haiku`)
+- `llm_max_subcommands`: `25` (max subcommands to scan per level)
+- `llm_max_doc_chars`: `30000` (truncate help text if longer)
+- `llm_timeout_s`: `180` (timeout per LLM call)
+
+**Manual generation:**
+
+```bash
+# Generate and cache JSON for a command (also prints it)
+~/.config/fish/functions/shellock.py generate git --print
+
+# Control depth and subcommand limits
+~/.config/fish/functions/shellock.py generate docker --max-depth 2 --max-subcommands 10
+```
 
 ## Data Storage
 
@@ -138,21 +171,13 @@ Shellock stores durable command metadata in:
 
 You can override this location with `SHELLOCK_HOME`.
 
-## Supported Formats
-
-Shellock parses various man page formats:
-
-- **GNU style**: `-x, --long-option` with description on next line
-- **BSD style**: `-x      Description on same line`
-- **Multiple flags**: `-R, -r, --recursive`
-- **Single-dash long flags**: `-name pattern` (find, java style)
-- **Tree style**: `-L level` with description below
-
 ## Known Limitations
 
-- Some commands with unusual man page formats may not parse correctly
-- Commands that open interactive help (like `git commit --help` opening a pager) require man page fallback
-- Combined short flags like `-rf` are split into individual flags
+- Requires `ccs` or `claude` CLI (Claude Code) for LLM-based extraction
+- First-time command scans take time (runs in background)
+- LLM extraction quality depends on help text formatting
+- Combined short flags like `-rf` are split into individual flags during lookup
+- Proxy configuration requires manual code edit in `shellock.py` (line 260)
 
 ## Files
 
