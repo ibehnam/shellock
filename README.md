@@ -102,7 +102,7 @@ Examples:
 	
 	# Use LLM scanning for background learning/refresh as well
 	export SHELLOCK_SCAN_BACKEND=llm
-	export SHELLOCK_LLM_MODEL=haiku
+	export SHELLOCK_LLM_MODEL=sonnet
 	```
 	
 	Config file (optional, only if you want to customize defaults):
@@ -113,7 +113,7 @@ Examples:
 	{
 	  "scan_backend": "llm",
 	  "doc_order": ["help", "man"],
-	  "llm_model": "haiku",
+	  "llm_model": "sonnet",
 	  "llm_max_subcommands": 25,
 	  "llm_max_doc_chars": 30000,
 	  "llm_timeout_s": 180
@@ -122,8 +122,8 @@ Examples:
 
 	Defaults:
 	- `scan_backend`: `llm` (LLM then regex fallback)
-	- `doc_order`: `["man", "help"]` (scan `man` first, fall back to `help` only if missing)
-	- `llm_model`: `haiku`
+	- `doc_order`: `["help", "man"]` (scan `help` first, fall back to `man` only if missing)
+	- `llm_model`: `sonnet`
 	- `llm_max_subcommands`: `25`
 	- `llm_max_doc_chars`: `30000`
 	- `llm_timeout_s`: `180`

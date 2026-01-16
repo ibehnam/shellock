@@ -27,7 +27,9 @@ import argparse
 import json
 import os
 import re
+import signal
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -39,6 +41,8 @@ from typing import Final, Protocol, TypedDict
 # Constants
 PROTOCOL_VERSION: Final[int] = 1
 
+SubcommandPath = tuple[str, ...]
+
 
 class Sources(TypedDict):
     help: bool
@@ -49,6 +53,7 @@ class SubcommandData(TypedDict):
     generated_at: str
     sources: Sources
     flags: dict[str, str]
+    subcommands: dict[str, "SubcommandData"]
 
 
 class CommandData(TypedDict):
@@ -58,6 +63,34 @@ class CommandData(TypedDict):
     sources: Sources
     flags: dict[str, str]
     subcommands: dict[str, SubcommandData]
+
+
+def _subcommand_schema_ref() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "generated_at": {"type": "string", "minLength": 1},
+            "sources": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "help": {"type": "boolean"},
+                    "man": {"type": "boolean"},
+                },
+                "required": ["help", "man"],
+            },
+            "flags": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+            "subcommands": {
+                "type": "object",
+                "additionalProperties": {"$ref": "#/$defs/subcommand"},
+            },
+        },
+        "required": ["generated_at", "sources", "flags", "subcommands"],
+    }
 
 
 def command_data_json_schema() -> dict:
@@ -84,29 +117,10 @@ def command_data_json_schema() -> dict:
             },
             "subcommands": {
                 "type": "object",
-                "additionalProperties": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "generated_at": {"type": "string", "minLength": 1},
-                        "sources": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "help": {"type": "boolean"},
-                                "man": {"type": "boolean"},
-                            },
-                            "required": ["help", "man"],
-                        },
-                        "flags": {
-                            "type": "object",
-                            "additionalProperties": {"type": "string"},
-                        },
-                    },
-                    "required": ["generated_at", "sources", "flags"],
-                },
+                "additionalProperties": {"$ref": "#/$defs/subcommand"},
             },
         },
+        "$defs": {"subcommand": _subcommand_schema_ref()},
         "required": [
             "protocol_version",
             "command",
@@ -137,8 +151,12 @@ def subcommand_data_json_schema() -> dict:
                 "type": "object",
                 "additionalProperties": {"type": "string"},
             },
+            "subcommands": {
+                "type": "object",
+                "additionalProperties": {"$ref": "#"},
+            },
         },
-        "required": ["generated_at", "sources", "flags"],
+        "required": ["generated_at", "sources", "flags", "subcommands"],
     }
 
 
@@ -167,16 +185,51 @@ def _parse_first_json_value(*, text: str) -> object:
 
 @dataclass(frozen=True, slots=True)
 class ClaudeCodeAgent:
-    model: str = "haiku"
-    executable: str = "claude"
+    model: str = "sonnet"
+    # executable: str = "claude"
+    executable: str = "ccs ghcp"
 
     def run_json(
         self, *, prompt: str, json_schema: dict, timeout_s: int | None = None
     ) -> object:
         schema_arg = json.dumps(json_schema, separators=(",", ":"), sort_keys=True)
+        base_cmd = shlex.split(self.executable)
+        if not base_cmd:
+            raise LlmAgentError("Agent executable is empty")
+        verbosity = _llm_verbose_level()
+        if verbosity:
+            print(
+                "[shellock] LLM agent start",
+                file=sys.stderr,
+            )
+            print(
+                f"[shellock] executable: {shlex.join(base_cmd)}",
+                file=sys.stderr,
+            )
+            print(
+                f"[shellock] model: {self.model}",
+                file=sys.stderr,
+            )
+            print(
+                f"[shellock] prompt chars: {len(prompt)}",
+                file=sys.stderr,
+            )
+            print(
+                f"[shellock] schema chars: {len(schema_arg)}",
+                file=sys.stderr,
+            )
+            print(
+                f"[shellock] timeout_s: {timeout_s or 120}",
+                file=sys.stderr,
+            )
+            if verbosity > 1:
+                print("[shellock] prompt:", file=sys.stderr)
+                print(prompt, file=sys.stderr)
+                print("[shellock] json schema:", file=sys.stderr)
+                print(schema_arg, file=sys.stderr)
         cmd = [
-            self.executable,
-            "-p",
+            *base_cmd,
+            "--print",
             "--output-format",
             "json",
             "--no-session-persistence",
@@ -198,12 +251,15 @@ class ClaudeCodeAgent:
                 timeout=timeout_s or 120,
             )
         except FileNotFoundError as e:
-            raise LlmAgentError(
-                f"Agent executable not found: {self.executable}"
-            ) from e
+            raise LlmAgentError(f"Agent executable not found: {self.executable}") from e
         except subprocess.TimeoutExpired as e:
             raise LlmAgentError("Agent call timed out") from e
 
+        if verbosity:
+            print(
+                f"[shellock] LLM agent exit: {result.returncode}",
+                file=sys.stderr,
+            )
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
             raise LlmAgentError(
@@ -211,6 +267,21 @@ class ClaudeCodeAgent:
             )
 
         raw = (result.stdout or "").strip()
+        if verbosity:
+            stdout_len = len(result.stdout or "")
+            stderr_len = len(result.stderr or "")
+            print(
+                f"[shellock] LLM agent stdout chars: {stdout_len}",
+                file=sys.stderr,
+            )
+            if stderr_len:
+                print(
+                    f"[shellock] LLM agent stderr chars: {stderr_len}",
+                    file=sys.stderr,
+                )
+            if verbosity > 1 and result.stderr:
+                print("[shellock] LLM agent stderr:", file=sys.stderr)
+                print(result.stderr, file=sys.stderr)
         if not raw:
             raise LlmAgentError("Agent returned empty output")
         try:
@@ -247,6 +318,32 @@ def _validate_flags(*, flags: object) -> dict[str, str]:
     return out
 
 
+def _validate_subcommand_payload(*, payload: object) -> SubcommandData:
+    if not isinstance(payload, dict):
+        raise ValueError("subcommand payload must be an object")
+    generated_at = payload.get("generated_at")
+    if not isinstance(generated_at, str) or not generated_at:
+        raise ValueError("subcommand generated_at must be a non-empty string")
+    sources = _validate_sources(sources=payload.get("sources"))
+    flags = _validate_flags(flags=payload.get("flags"))
+    subcommands_raw = payload.get("subcommands")
+    if subcommands_raw is None:
+        subcommands_raw = {}
+    if not isinstance(subcommands_raw, dict):
+        raise ValueError("subcommand subcommands must be an object")
+    subcommands: dict[str, SubcommandData] = {}
+    for sub_name, sub_payload in subcommands_raw.items():
+        if not isinstance(sub_name, str) or not sub_name:
+            raise ValueError("subcommand names must be non-empty strings")
+        subcommands[sub_name] = _validate_subcommand_payload(payload=sub_payload)
+    return {
+        "generated_at": generated_at,
+        "sources": sources,
+        "flags": flags,
+        "subcommands": subcommands,
+    }
+
+
 def validate_command_data(*, payload: object, command: str) -> CommandData:
     if not isinstance(payload, dict):
         raise ValueError("payload must be an object")
@@ -268,18 +365,7 @@ def validate_command_data(*, payload: object, command: str) -> CommandData:
     for sub_name, sub_payload in subcommands_raw.items():
         if not isinstance(sub_name, str) or not sub_name:
             raise ValueError("subcommand names must be non-empty strings")
-        if not isinstance(sub_payload, dict):
-            raise ValueError("subcommand payload must be an object")
-        sub_generated_at = sub_payload.get("generated_at")
-        if not isinstance(sub_generated_at, str) or not sub_generated_at:
-            raise ValueError("subcommand generated_at must be a non-empty string")
-        sub_sources = _validate_sources(sources=sub_payload.get("sources"))
-        sub_flags = _validate_flags(flags=sub_payload.get("flags"))
-        subcommands[sub_name] = {
-            "generated_at": sub_generated_at,
-            "sources": sub_sources,
-            "flags": sub_flags,
-        }
+        subcommands[sub_name] = _validate_subcommand_payload(payload=sub_payload)
 
     return {
         "protocol_version": PROTOCOL_VERSION,
@@ -292,14 +378,8 @@ def validate_command_data(*, payload: object, command: str) -> CommandData:
 
 
 def validate_subcommand_data(*, payload: object) -> SubcommandData:
-    if not isinstance(payload, dict):
-        raise ValueError("payload must be an object")
-    generated_at = payload.get("generated_at")
-    if not isinstance(generated_at, str) or not generated_at:
-        raise ValueError("generated_at must be a non-empty string")
-    sources = _validate_sources(sources=payload.get("sources"))
-    flags = _validate_flags(flags=payload.get("flags"))
-    return {"generated_at": generated_at, "sources": sources, "flags": flags}
+    return _validate_subcommand_payload(payload=payload)
+
 
 # ANSI colors for terminal output
 DIM: Final[str] = "\033[2m"
@@ -310,14 +390,18 @@ CYAN: Final[str] = "\033[36m"
 # Some commands need special help invocations to show all flags
 HELP_SOURCE_OVERRIDES: Final[dict[str, object]] = {
     "curl": ["curl", "--help", "all"],
-    "git": lambda subcmd: ["git", "help", subcmd] if subcmd else ["git", "-h"],
-    "docker": lambda subcmd: ["docker", subcmd, "--help"]
-    if subcmd
-    else ["docker", "--help"],
-    "kubectl": lambda subcmd: ["kubectl", subcmd, "--help"]
-    if subcmd
-    else ["kubectl", "--help"],
-    "npm": lambda subcmd: ["npm", subcmd, "--help"] if subcmd else ["npm", "--help"],
+    "git": lambda subcmds: (
+        ["git", *subcmds, "-h"] if subcmds else ["git", "-h"]
+    ),
+    "docker": lambda subcmds: (
+        ["docker", *subcmds, "--help"] if subcmds else ["docker", "--help"]
+    ),
+    "kubectl": lambda subcmds: (
+        ["kubectl", *subcmds, "--help"] if subcmds else ["kubectl", "--help"]
+    ),
+    "npm": lambda subcmds: (
+        ["npm", *subcmds, "--help"] if subcmds else ["npm", "--help"]
+    ),
 }
 
 
@@ -359,12 +443,32 @@ def _load_config() -> dict:
 
 def _config_get(*, key: str) -> object | None:
     # Environment variables override config.json for quick experimentation.
-    # Example: `SHELLOCK_SCAN_BACKEND=llm`, `SHELLOCK_LLM_MODEL=haiku`.
+    # Example: `SHELLOCK_SCAN_BACKEND=llm`, `SHELLOCK_LLM_MODEL=sonnet`.
     env_key = f"SHELLOCK_{key.upper()}"
     env_val = os.environ.get(env_key)
     if env_val is not None and env_val.strip() != "":
         return env_val
     return _load_config().get(key)
+
+
+def _llm_verbose_level() -> int:
+    raw = _config_get(key="llm_verbose")
+    if raw is None:
+        return 0
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    if isinstance(raw, int):
+        if raw <= 0:
+            return 0
+        return 2 if raw > 1 else 1
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in {"", "0", "false", "no", "off"}:
+            return 0
+        if value in {"1", "true", "yes", "on", "basic"}:
+            return 1
+        return 2
+    return 0
 
 
 def _doc_order() -> list[str]:
@@ -382,7 +486,7 @@ def _doc_order() -> list[str]:
         if item in allowed and item not in ordered:
             ordered.append(item)
 
-    default_order = ["man", "help"]
+    default_order = ["help", "man"]
     if not ordered:
         return default_order
     for item in default_order:
@@ -399,14 +503,27 @@ def _command_file_name(command: str) -> str:
     return safe
 
 
+def _command_exists(*, command: str) -> bool:
+    if not command:
+        return False
+    if "/" in command or "\\" in command:
+        path = Path(command).expanduser()
+        return path.is_file() and os.access(path, os.X_OK)
+    return shutil.which(command) is not None
+
+
 def command_data_path(*, command: str) -> Path:
     return shellock_data_dir() / f"{_command_file_name(command)}.json"
 
 
 class HelpProvider(Protocol):
-    def get_help_text(self, *, command: str, subcommand: str | None) -> str | None: ...
+    def get_help_text(
+        self, *, command: str, subcommand: SubcommandPath | None
+    ) -> str | None: ...
 
-    def get_man_text(self, *, command: str, subcommand: str | None) -> str | None: ...
+    def get_man_text(
+        self, *, command: str, subcommand: SubcommandPath | None
+    ) -> str | None: ...
 
 
 class FlagExtractor(Protocol):
@@ -436,10 +553,14 @@ class CommandProtocol:
 
 
 class DefaultHelpProvider:
-    def get_help_text(self, *, command: str, subcommand: str | None) -> str | None:
+    def get_help_text(
+        self, *, command: str, subcommand: SubcommandPath | None
+    ) -> str | None:
         return get_help_text(command=command, subcommand=subcommand)
 
-    def get_man_text(self, *, command: str, subcommand: str | None) -> str | None:
+    def get_man_text(
+        self, *, command: str, subcommand: SubcommandPath | None
+    ) -> str | None:
         return get_man_text(command=command, subcommand=subcommand)
 
 
@@ -504,7 +625,7 @@ class HelpAndMan:
 
 
 def _get_help_and_man(
-    *, protocol: CommandProtocol, command: str, subcommand: str | None
+    *, protocol: CommandProtocol, command: str, subcommand: SubcommandPath | None
 ) -> HelpAndMan:
     return HelpAndMan(
         help_text=protocol.help_provider.get_help_text(
@@ -545,135 +666,39 @@ def _truncate_for_prompt(*, text: str, max_chars: int) -> str:
     return text[:max_chars] + "\n\n[... truncated ...]\n"
 
 
-def generate_command_data_llm(
+def _subcommand_path_label(subcommand: SubcommandPath | None) -> str:
+    if not subcommand:
+        return ""
+    return " ".join(subcommand)
+
+
+def _llm_extract_node_data(
     *,
     protocol: CommandProtocol,
     agent: StructuredJsonAgent,
     command: str,
-    max_subcommands: int,
-    max_doc_chars: int,
-    timeout_s: int,
-) -> CommandData:
-    """Generate and persist command JSON using an external LLM agent."""
-    root_docs = _get_help_and_man(protocol=protocol, command=command, subcommand=None)
-    root_used = _docs_for_scan(docs=root_docs)
-    root_primary = _primary_doc_text(docs=root_docs)
-    if root_primary is None:
-        raise LlmAgentError(f"No man page or help output found for: {command}")
-
-    discovered = sorted(
-        protocol.subcommands.discover(
-            command=command,
-            help_text=root_used.help_text,
-            man_text=root_used.man_text,
-        )
-    )
-    subcommands = discovered[: max(0, max_subcommands)]
-
-    now = _utc_now_iso()
-
-    prompt_parts: list[str] = []
-    prompt_parts.append(
-        "\n".join(
-            [
-                "You are given documentation text for a CLI command and some of its subcommands.",
-                "Produce a single JSON value that matches the provided JSON Schema exactly.",
-                "",
-                "Extraction rules:",
-                "- Do not invent flags, subcommands, or descriptions.",
-                "- Only include options/flags (typically tokens that start with '-' or '--').",
-                "- Use the flag token only (omit argument placeholders like '<path>' or '=VALUE').",
-                "- Keep descriptions concise (ideally <= 160 chars).",
-                "",
-                f"Target command: {command}",
-                f"protocol_version must be: {PROTOCOL_VERSION}",
-                f"generated_at must be: {now}",
-                "",
-                "Fill `sources` booleans based on which docs are used (help/man).",
-                f"Documentation order: {', '.join(_doc_order())}",
-                "",
-            ]
-        )
-    )
-
-    root_kind, root_text = root_primary
-    prompt_parts.append(f"== {command} ({root_kind}) ==")
-    prompt_parts.append(_truncate_for_prompt(text=root_text, max_chars=max_doc_chars))
-
-    sub_docs: dict[str, HelpAndMan] = {}
-    for sub in subcommands:
-        docs = _get_help_and_man(protocol=protocol, command=command, subcommand=sub)
-        used = _docs_for_scan(docs=docs)
-        primary = _primary_doc_text(docs=docs)
-        if primary is None:
-            continue
-        sub_docs[sub] = used
-        kind, text = primary
-        prompt_parts.append(f"== {command} {sub} ({kind}) ==")
-        prompt_parts.append(_truncate_for_prompt(text=text, max_chars=max_doc_chars))
-
-    prompt = "\n".join(prompt_parts).strip() + "\n"
-
-    candidate = agent.run_json(
-        prompt=prompt,
-        json_schema=command_data_json_schema(),
-        timeout_s=timeout_s,
-    )
-
-    if not isinstance(candidate, dict):
-        raise LlmAgentError("Agent output was not a JSON object")
-
-    # Normalize/override non-LLM fields to ensure determinism.
-    candidate["protocol_version"] = PROTOCOL_VERSION
-    candidate["command"] = command
-    candidate["generated_at"] = now
-    candidate["sources"] = _sources_from_docs(docs=root_used)
-
-    if not isinstance(candidate.get("flags"), dict):
-        candidate["flags"] = {}
-
-    raw_subs = candidate.get("subcommands")
-    if not isinstance(raw_subs, dict):
-        raw_subs = {}
-
-    normalized_subs: dict[str, dict] = {}
-    for sub in sub_docs.keys():
-        sub_payload = raw_subs.get(sub)
-        if not isinstance(sub_payload, dict):
-            sub_payload = {}
-        if not isinstance(sub_payload.get("flags"), dict):
-            sub_payload["flags"] = {}
-        sub_payload["generated_at"] = now
-        sub_payload["sources"] = _sources_from_docs(docs=sub_docs[sub])
-        normalized_subs[sub] = sub_payload
-
-    candidate["subcommands"] = normalized_subs
-
-    return validate_command_data(payload=candidate, command=command)
-
-
-def generate_subcommand_data_llm(
-    *,
-    protocol: CommandProtocol,
-    agent: StructuredJsonAgent,
-    command: str,
-    subcommand: str,
+    subcommand: SubcommandPath | None,
+    docs: HelpAndMan | None,
     max_doc_chars: int,
     timeout_s: int,
 ) -> SubcommandData:
-    docs = _get_help_and_man(protocol=protocol, command=command, subcommand=subcommand)
+    docs = docs or _get_help_and_man(
+        protocol=protocol, command=command, subcommand=subcommand
+    )
     used_docs = _docs_for_scan(docs=docs)
     primary = _primary_doc_text(docs=docs)
     if primary is None:
-        raise LlmAgentError(
-            f"No man page or help output found for: {command} {subcommand}"
-        )
+        target = command if not subcommand else f"{command} {_subcommand_path_label(subcommand)}"
+        raise LlmAgentError(f"No man page or help output found for: {target}")
+
     now = _utc_now_iso()
     kind, text = primary
+    target = command if not subcommand else f"{command} {_subcommand_path_label(subcommand)}"
+    header = "CLI command" if not subcommand else "CLI subcommand"
     prompt = (
         "\n".join(
             [
-                "You are given documentation text for a CLI subcommand.",
+                f"You are given documentation text for a {header}.",
                 "Produce a single JSON value that matches the provided JSON Schema exactly.",
                 "",
                 "Extraction rules:",
@@ -682,10 +707,10 @@ def generate_subcommand_data_llm(
                 "- Use the flag token only (omit argument placeholders like '<path>' or '=VALUE').",
                 "- Keep descriptions concise (ideally <= 160 chars).",
                 "",
-                f"Target: {command} {subcommand}",
+                f"Target: {target}",
                 f"generated_at must be: {now}",
                 "",
-                f"== {command} {subcommand} ({kind}) ==",
+                f"== {target} ({kind}) ==",
                 _truncate_for_prompt(text=text, max_chars=max_doc_chars),
             ]
         ).strip()
@@ -705,8 +730,54 @@ def generate_subcommand_data_llm(
     candidate["sources"] = _sources_from_docs(docs=used_docs)
     if not isinstance(candidate.get("flags"), dict):
         candidate["flags"] = {}
+    candidate["subcommands"] = {}
 
     return validate_subcommand_data(payload=candidate)
+
+
+def generate_command_data_llm(
+    *,
+    protocol: CommandProtocol,
+    agent: StructuredJsonAgent,
+    command: str,
+    max_subcommands: int,
+    max_doc_chars: int,
+    timeout_s: int,
+    max_depth: int,
+) -> CommandData:
+    """Generate and persist command JSON using an external LLM agent."""
+    max_subs = max_subcommands if max_subcommands > 0 else None
+    return _scan_command_tree(
+        protocol=protocol,
+        command=command,
+        backend="llm-only",
+        agent=agent,
+        max_depth=max_depth,
+        max_subcommands=max_subs,
+        max_doc_chars=max_doc_chars,
+        timeout_s=timeout_s,
+    )
+
+
+def generate_subcommand_data_llm(
+    *,
+    protocol: CommandProtocol,
+    agent: StructuredJsonAgent,
+    command: str,
+    subcommand: SubcommandPath,
+    max_doc_chars: int,
+    timeout_s: int,
+    docs: HelpAndMan | None = None,
+) -> SubcommandData:
+    return _llm_extract_node_data(
+        protocol=protocol,
+        agent=agent,
+        command=command,
+        subcommand=subcommand,
+        docs=docs,
+        max_doc_chars=max_doc_chars,
+        timeout_s=timeout_s,
+    )
 
 
 def _scan_backend() -> str:
@@ -726,25 +797,198 @@ def _setting_int(*, config_key: str, default: int) -> int:
         return default
 
 
+def _max_subcommand_depth() -> int:
+    return max(0, _setting_int(config_key="max_subcommand_depth", default=3))
+
+
 def _llm_agent_from_env() -> StructuredJsonAgent:
     cfg = _config_get(key="llm_model")
-    model = cfg.strip() if isinstance(cfg, str) and cfg.strip() else "haiku"
+    model = cfg.strip() if isinstance(cfg, str) and cfg.strip() else "sonnet"
     return ClaudeCodeAgent(model=model)
 
 
-def _scan_flags_and_subcommands(
-    *, protocol: CommandProtocol, command: str, subcommand: str | None
-) -> ScanResult:
-    docs = _get_help_and_man(
-        protocol=protocol, command=command, subcommand=subcommand
+def _apply_subcommand_limit(
+    *, discovered: set[str], max_subcommands: int | None
+) -> list[str]:
+    ordered = sorted(discovered)
+    if max_subcommands is None or max_subcommands <= 0:
+        return ordered
+    return ordered[:max_subcommands]
+
+
+def _extract_flags_for_node(
+    *,
+    protocol: CommandProtocol,
+    command: str,
+    subcommand: SubcommandPath | None,
+    docs: HelpAndMan,
+    backend: str,
+    agent: StructuredJsonAgent | None,
+    max_doc_chars: int,
+    timeout_s: int,
+) -> tuple[dict[str, str], Sources, HelpAndMan]:
+    used_docs = _docs_for_scan(docs=docs)
+    if not used_docs.help_text and not used_docs.man_text:
+        if backend == "llm-only" and subcommand is None:
+            raise LlmAgentError(f"No man page or help output found for: {command}")
+        return {}, _sources_from_docs(docs=used_docs), used_docs
+
+    if backend in {"llm", "llm-only", "auto"}:
+        if agent is None:
+            raise LlmAgentError("LLM backend requested without an agent")
+        try:
+            llm_data = _llm_extract_node_data(
+                protocol=protocol,
+                agent=agent,
+                command=command,
+                subcommand=subcommand,
+                docs=docs,
+                max_doc_chars=max_doc_chars,
+                timeout_s=timeout_s,
+            )
+            return llm_data["flags"], llm_data["sources"], used_docs
+        except LlmAgentError:
+            if backend == "llm-only":
+                raise
+
+    flags: dict[str, str] = {}
+    sources = _sources_from_docs(docs=used_docs)
+
+    if used_docs.help_text:
+        flags.update(
+            protocol.extractor.extract_from_help(help_text=used_docs.help_text)
+        )
+
+    if used_docs.man_text:
+        flags.update(protocol.extractor.extract_from_man(man_text=used_docs.man_text))
+
+    return flags, sources, used_docs
+
+
+def _scan_subcommand_tree(
+    *,
+    protocol: CommandProtocol,
+    command: str,
+    subcommand: SubcommandPath,
+    depth_remaining: int,
+    backend: str,
+    agent: StructuredJsonAgent | None,
+    max_subcommands: int | None,
+    max_doc_chars: int,
+    timeout_s: int,
+) -> SubcommandData:
+    docs = _get_help_and_man(protocol=protocol, command=command, subcommand=subcommand)
+    flags, sources, used_docs = _extract_flags_for_node(
+        protocol=protocol,
+        command=command,
+        subcommand=subcommand,
+        docs=docs,
+        backend=backend,
+        agent=agent,
+        max_doc_chars=max_doc_chars,
+        timeout_s=timeout_s,
     )
+
+    discovered = protocol.subcommands.discover(
+        command=command,
+        help_text=used_docs.help_text,
+        man_text=used_docs.man_text,
+    )
+
+    subcommands: dict[str, SubcommandData] = {}
+    if depth_remaining > 0:
+        for sub in _apply_subcommand_limit(
+            discovered=discovered, max_subcommands=max_subcommands
+        ):
+            subcommands[sub] = _scan_subcommand_tree(
+                protocol=protocol,
+                command=command,
+                subcommand=subcommand + (sub,),
+                depth_remaining=depth_remaining - 1,
+                backend=backend,
+                agent=agent,
+                max_subcommands=max_subcommands,
+                max_doc_chars=max_doc_chars,
+                timeout_s=timeout_s,
+            )
+
+    return {
+        "generated_at": _utc_now_iso(),
+        "sources": sources,
+        "flags": flags,
+        "subcommands": subcommands,
+    }
+
+
+def _scan_command_tree(
+    *,
+    protocol: CommandProtocol,
+    command: str,
+    backend: str,
+    agent: StructuredJsonAgent | None,
+    max_depth: int,
+    max_subcommands: int | None,
+    max_doc_chars: int,
+    timeout_s: int,
+) -> CommandData:
+    docs = _get_help_and_man(protocol=protocol, command=command, subcommand=None)
+    flags, sources, used_docs = _extract_flags_for_node(
+        protocol=protocol,
+        command=command,
+        subcommand=None,
+        docs=docs,
+        backend=backend,
+        agent=agent,
+        max_doc_chars=max_doc_chars,
+        timeout_s=timeout_s,
+    )
+
+    discovered = protocol.subcommands.discover(
+        command=command,
+        help_text=used_docs.help_text,
+        man_text=used_docs.man_text,
+    )
+
+    subcommands: dict[str, SubcommandData] = {}
+    if max_depth > 0:
+        for sub in _apply_subcommand_limit(
+            discovered=discovered, max_subcommands=max_subcommands
+        ):
+            subcommands[sub] = _scan_subcommand_tree(
+                protocol=protocol,
+                command=command,
+                subcommand=(sub,),
+                depth_remaining=max_depth - 1,
+                backend=backend,
+                agent=agent,
+                max_subcommands=max_subcommands,
+                max_doc_chars=max_doc_chars,
+                timeout_s=timeout_s,
+            )
+
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "command": command,
+        "generated_at": _utc_now_iso(),
+        "sources": sources,
+        "flags": flags,
+        "subcommands": subcommands,
+    }
+
+
+def _scan_flags_and_subcommands(
+    *, protocol: CommandProtocol, command: str, subcommand: SubcommandPath | None
+) -> ScanResult:
+    docs = _get_help_and_man(protocol=protocol, command=command, subcommand=subcommand)
     used_docs = _docs_for_scan(docs=docs)
 
     flags: dict[str, str] = {}
     sources = _sources_from_docs(docs=used_docs)
 
     if used_docs.help_text:
-        flags.update(protocol.extractor.extract_from_help(help_text=used_docs.help_text))
+        flags.update(
+            protocol.extractor.extract_from_help(help_text=used_docs.help_text)
+        )
 
     if used_docs.man_text:
         flags.update(protocol.extractor.extract_from_man(man_text=used_docs.man_text))
@@ -817,20 +1061,65 @@ def _notify_fish_scan_complete(*, command: str) -> None:
     to `__shellock_scan_done` and refresh the hint.
     """
     payload = f"{command}:{int(time.time() * 1000)}"
-    try:
-        subprocess.run(
-            ["fish", "-c", 'set -U __shellock_scan_done -- "$SHELLOCK_SCAN_DONE"'],
-            env={**os.environ, "SHELLOCK_SCAN_DONE": payload},
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=1,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    env = {**os.environ, "SHELLOCK_SCAN_DONE": payload}
+    candidates = [
+        # Avoid loading user config (can be slow); fall back if unsupported.
+        (["fish", "--no-config", "-c"], 2),
+        (["fish", "-c"], 5),
+    ]
+
+    for prefix, timeout_s in candidates:
+        try:
+            result = subprocess.run(
+                [
+                    *prefix,
+                    'set -U __shellock_scan_done -- "$SHELLOCK_SCAN_DONE"',
+                ],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_s,
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        except Exception:
+            # Non-fatal: shellock still works without live refresh.
+            break
+
+    _signal_fish_pid_from_env()
+
+
+def _signal_fish_pid_from_env() -> None:
+    """Wake up a specific interactive fish session, if provided.
+
+    Some fish setups only process universal-variable updates on the next
+    keystroke. When Shellock is invoked from fish, the integration can pass
+    `SHELLOCK_FISH_PID=$fish_pid` so the detached scan can signal that exact
+    shell instance.
+    """
+    raw = os.environ.get("SHELLOCK_FISH_PID")
+    if not raw:
         return
+
+    try:
+        pid = int(raw)
+    except ValueError:
+        return
+    if pid <= 0:
+        return
+
+    try:
+        sig = signal.SIGUSR1
+    except AttributeError:
+        return
+
+    try:
+        os.kill(pid, sig)
     except Exception:
-        # Non-fatal: shellock still works without live refresh.
         return
 
 
@@ -841,24 +1130,25 @@ def ensure_command_scanned(
 
     if data is None or refresh:
         backend = _scan_backend()
+        max_depth = _max_subcommand_depth()
+        max_subcommands = (
+            _setting_int(config_key="llm_max_subcommands", default=25)
+            if backend in {"llm", "llm-only", "auto"}
+            else None
+        )
+        max_doc_chars = _setting_int(config_key="llm_max_doc_chars", default=30000)
+        timeout_s = _setting_int(config_key="llm_timeout_s", default=180)
+
         if backend in {"llm", "llm-only", "auto"}:
             try:
                 llm_data = generate_command_data_llm(
                     protocol=protocol,
                     agent=_llm_agent_from_env(),
                     command=command,
-                    max_subcommands=_setting_int(
-                        config_key="llm_max_subcommands",
-                        default=25,
-                    ),
-                    max_doc_chars=_setting_int(
-                        config_key="llm_max_doc_chars",
-                        default=30000,
-                    ),
-                    timeout_s=_setting_int(
-                        config_key="llm_timeout_s",
-                        default=180,
-                    ),
+                    max_subcommands=max_subcommands or 0,
+                    max_doc_chars=max_doc_chars,
+                    timeout_s=timeout_s,
+                    max_depth=max_depth,
                 )
                 save_command_data(command=command, data=llm_data)
                 return llm_data
@@ -866,29 +1156,16 @@ def ensure_command_scanned(
                 if backend == "llm-only":
                     raise
 
-        scan = _scan_flags_and_subcommands(
-            protocol=protocol, command=command, subcommand=None
+        data = _scan_command_tree(
+            protocol=protocol,
+            command=command,
+            backend="regex",
+            agent=None,
+            max_depth=max_depth,
+            max_subcommands=None,
+            max_doc_chars=max_doc_chars,
+            timeout_s=timeout_s,
         )
-        subcommands: dict[str, dict] = {}
-
-        for sub in sorted(scan.discovered_subcommands):
-            sub_scan = _scan_flags_and_subcommands(
-                protocol=protocol, command=command, subcommand=sub
-            )
-            subcommands[sub] = {
-                "generated_at": _utc_now_iso(),
-                "sources": sub_scan.sources,
-                "flags": sub_scan.flags,
-            }
-
-        data = {
-            "protocol_version": PROTOCOL_VERSION,
-            "command": command,
-            "generated_at": _utc_now_iso(),
-            "sources": scan.sources,
-            "flags": scan.flags,
-            "subcommands": subcommands,
-        }
         save_command_data(command=command, data=data)
         return data
 
@@ -896,70 +1173,75 @@ def ensure_command_scanned(
 
 
 def ensure_subcommand_scanned(
-    *, protocol: CommandProtocol, command: str, subcommand: str
+    *, protocol: CommandProtocol, command: str, subcommand: SubcommandPath
 ) -> dict:
     data = ensure_command_scanned(protocol=protocol, command=command, refresh=False)
-    subcommands = data.get("subcommands", {})
+    backend = _scan_backend()
+    max_depth = _max_subcommand_depth()
+    max_subcommands = (
+        _setting_int(config_key="llm_max_subcommands", default=25)
+        if backend in {"llm", "llm-only", "auto"}
+        else None
+    )
+    max_doc_chars = _setting_int(config_key="llm_max_doc_chars", default=30000)
+    timeout_s = _setting_int(config_key="llm_timeout_s", default=180)
+    agent = _llm_agent_from_env() if backend in {"llm", "llm-only", "auto"} else None
 
-    if subcommand not in subcommands:
-        backend = _scan_backend()
-        if backend in {"llm", "llm-only", "auto"}:
-            try:
-                sub_data = generate_subcommand_data_llm(
-                    protocol=protocol,
-                    agent=_llm_agent_from_env(),
-                    command=command,
-                    subcommand=subcommand,
-                    max_doc_chars=_setting_int(
-                        config_key="llm_max_doc_chars",
-                        default=30000,
-                    ),
-                    timeout_s=_setting_int(
-                        config_key="llm_timeout_s",
-                        default=180,
-                    ),
-                )
-                subcommands[subcommand] = sub_data
-            except LlmAgentError:
-                if backend == "llm-only":
-                    raise
-        if subcommand not in subcommands:
-            sub_scan = _scan_flags_and_subcommands(
-                protocol=protocol, command=command, subcommand=subcommand
+    cursor: dict | None = data
+    updated = False
+    for idx, part in enumerate(subcommand):
+        if not isinstance(cursor, dict):
+            break
+        subcommands = cursor.get("subcommands")
+        if not isinstance(subcommands, dict):
+            subcommands = {}
+            cursor["subcommands"] = subcommands
+            updated = True
+        node = subcommands.get(part)
+        if not isinstance(node, dict):
+            remaining_depth = max(0, max_depth - (idx + 1))
+            node = _scan_subcommand_tree(
+                protocol=protocol,
+                command=command,
+                subcommand=subcommand[: idx + 1],
+                depth_remaining=remaining_depth,
+                backend=backend,
+                agent=agent,
+                max_subcommands=max_subcommands,
+                max_doc_chars=max_doc_chars,
+                timeout_s=timeout_s,
             )
-            subcommands[subcommand] = {
-                "generated_at": _utc_now_iso(),
-                "sources": sub_scan.sources,
-                "flags": sub_scan.flags,
-            }
-        data["subcommands"] = subcommands
+            subcommands[part] = node
+            updated = True
+        cursor = node
+
+    if updated:
         save_command_data(command=command, data=data)
 
     return data
 
 
 def refresh_command(*, protocol: CommandProtocol, command: str) -> None:
-    existing = load_command_data(command=command) or {}
-
     backend = _scan_backend()
+    max_depth = _max_subcommand_depth()
+    max_subcommands = (
+        _setting_int(config_key="llm_max_subcommands", default=25)
+        if backend in {"llm", "llm-only", "auto"}
+        else None
+    )
+    max_doc_chars = _setting_int(config_key="llm_max_doc_chars", default=30000)
+    timeout_s = _setting_int(config_key="llm_timeout_s", default=180)
+
     if backend in {"llm", "llm-only", "auto"}:
         try:
             llm_data = generate_command_data_llm(
                 protocol=protocol,
                 agent=_llm_agent_from_env(),
                 command=command,
-                max_subcommands=_setting_int(
-                    config_key="llm_max_subcommands",
-                    default=25,
-                ),
-                max_doc_chars=_setting_int(
-                    config_key="llm_max_doc_chars",
-                    default=30000,
-                ),
-                timeout_s=_setting_int(
-                    config_key="llm_timeout_s",
-                    default=180,
-                ),
+                max_subcommands=max_subcommands or 0,
+                max_doc_chars=max_doc_chars,
+                timeout_s=timeout_s,
+                max_depth=max_depth,
             )
             save_command_data(command=command, data=llm_data)
             return
@@ -967,34 +1249,16 @@ def refresh_command(*, protocol: CommandProtocol, command: str) -> None:
             if backend == "llm-only":
                 raise
 
-    scan = _scan_flags_and_subcommands(
-        protocol=protocol, command=command, subcommand=None
+    data = _scan_command_tree(
+        protocol=protocol,
+        command=command,
+        backend="regex",
+        agent=None,
+        max_depth=max_depth,
+        max_subcommands=None,
+        max_doc_chars=max_doc_chars,
+        timeout_s=timeout_s,
     )
-
-    recorded_subs = set((existing.get("subcommands") or {}).keys())
-    discovered_subs = set(scan.discovered_subcommands)
-    all_subs = sorted(recorded_subs | discovered_subs)
-
-    subcommands: dict[str, dict] = {}
-    for sub in all_subs:
-        sub_scan = _scan_flags_and_subcommands(
-            protocol=protocol, command=command, subcommand=sub
-        )
-        subcommands[sub] = {
-            "generated_at": _utc_now_iso(),
-            "sources": sub_scan.sources,
-            "flags": sub_scan.flags,
-        }
-
-    data = {
-        "protocol_version": PROTOCOL_VERSION,
-        "command": command,
-        "generated_at": _utc_now_iso(),
-        "sources": scan.sources,
-        "flags": scan.flags,
-        "subcommands": subcommands,
-    }
-
     save_command_data(command=command, data=data)
 
 
@@ -1034,10 +1298,15 @@ class ParsedCommand:
 
     command: str
     flags: tuple[Flag, ...]
-    subcommand: str | None = None
+    subcommands: SubcommandPath = ()
 
 
-def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
+def parse_command_line(
+    *,
+    cmdline: str,
+    known_flags: set[str] | None = None,
+    known_subcommands: dict[str, dict] | None = None,
+) -> ParsedCommand | None:
     """
     Parse a command line string to extract command and flags.
 
@@ -1045,6 +1314,8 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
     - Short flags: -r, -v, -rf (combined)
     - Long flags: --raw-output, --verbose
     - Subcommands: git commit -m
+    - Subcommand paths: git remote add -f
+    - Known single-dash flags: -ngl (when provided in known_flags)
     """
     try:
         tokens = shlex.split(cmdline)
@@ -1057,7 +1328,7 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
 
     command = tokens[0]
     flags: list[Flag] = []
-    subcommand: str | None = None
+    subcommands: list[str] = []
 
     # Known commands with subcommands
     subcommand_commands = {
@@ -1071,6 +1342,9 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
         "uv",
     }
 
+    known_flag_set = set(known_flags or ())
+    subcommand_map = known_subcommands if isinstance(known_subcommands, dict) else None
+    parsing_subcommands = True
     i = 1
     skip_next = False  # Track if next token is a flag value
     while i < len(tokens):
@@ -1088,15 +1362,22 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
 
         # Check for subcommand (first non-flag after command)
         # Don't treat key=value pairs as subcommands (likely flag values)
-        if (
-            command in subcommand_commands
-            and subcommand is None
-            and not token.startswith("-")
-            and "=" not in token  # key=value pairs are likely flag values
-        ):
-            subcommand = token
-            i += 1
-            continue
+        if parsing_subcommands and not token.startswith("-") and "=" not in token:
+            if subcommand_map is not None:
+                sub_payload = subcommand_map.get(token)
+                if isinstance(sub_payload, dict):
+                    subcommands.append(token)
+                    subcommand_map = sub_payload.get("subcommands")
+                    if not isinstance(subcommand_map, dict):
+                        subcommand_map = {}
+                    i += 1
+                    continue
+                parsing_subcommands = False
+            elif command in subcommand_commands and not subcommands:
+                subcommands.append(token)
+                parsing_subcommands = False
+                i += 1
+                continue
 
         if token.startswith("--"):
             # Long flag: --raw-output or --key=value
@@ -1108,13 +1389,16 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
             # - Single-dash long flag: -name, -type (find, java style)
             # Heuristic: 4+ lowercase letters after dash = single-dash long flag
             # This handles -name (4), -type (4), -exec (4) but not -avz (3), -rf (2)
-            flag_part = token[1:]
-            if len(flag_part) >= 4 and flag_part.isalpha() and flag_part.islower():
+            flag_token = token.split("=", 1)[0]
+            flag_part = flag_token[1:]
+            if flag_token in known_flag_set:
+                flags.append(Flag(name=flag_token, is_long=False))
+            elif len(flag_part) >= 4 and flag_part.isalpha() and flag_part.islower():
                 # Likely a single-dash long flag (e.g., -name, -type, -exec)
-                flags.append(Flag(name=token, is_long=False))
+                flags.append(Flag(name=flag_token, is_long=False))
             else:
                 # Short flag(s): -r or -rf (combined)
-                for char in token[1:]:
+                for char in flag_part:
                     if char.isalpha():
                         flags.append(Flag(name=f"-{char}", is_long=False))
                     else:
@@ -1127,7 +1411,7 @@ def parse_command_line(*, cmdline: str) -> ParsedCommand | None:
     return ParsedCommand(
         command=command,
         flags=tuple(flags),
-        subcommand=subcommand,
+        subcommands=tuple(subcommands),
     )
 
 
@@ -1206,9 +1490,10 @@ def parse_help_output(*, help_text: str) -> dict[str, str]:
     # Pattern for flags with descriptions
     patterns = [
         # llama-cli style: -m,    --model FNAME                    description
-        r"^\s*(-\w+),\s+(--[\w-]+)\s+\S+\s{2,}(.+)$",
+        # Allow a single tab/space between arg and description.
+        r"^\s*(-\w+),\s+(--[\w-]+)\s+\S+\s+(.+)$",
         # llama-cli style without arg: -h,    --help, --usage       description
-        r"^\s*(-\w+),\s+(--[\w-]+)(?:,\s+--[\w-]+)*\s{2,}(.+)$",
+        r"^\s*(-\w+),\s+(--[\w-]+)(?:,\s+--[\w-]+)*\s+(.+)$",
         # claude style: --camelCase, --kebab-case <arg>  description
         r"^\s*(--[\w]+),\s+(--[\w-]+)\s+<[^>]+>\s{2,}(.+)$",
         # GNU style: -x, --long-option  Description
@@ -1400,7 +1685,20 @@ def parse_man_page(*, man_text: str) -> dict[str, str]:
     return flags
 
 
-def get_help_text(*, command: str, subcommand: str | None = None) -> str | None:
+def _subcommand_tokens(subcommand: SubcommandPath | str | None) -> list[str]:
+    if not subcommand:
+        return []
+    if isinstance(subcommand, str):
+        try:
+            return [tok for tok in shlex.split(subcommand) if tok]
+        except ValueError:
+            return [tok for tok in subcommand.split() if tok]
+    return list(subcommand)
+
+
+def get_help_text(
+    *, command: str, subcommand: SubcommandPath | None = None
+) -> str | None:
     """
     Get help output for a command.
 
@@ -1408,13 +1706,15 @@ def get_help_text(*, command: str, subcommand: str | None = None) -> str | None:
     Uses command-specific overrides for complex commands like curl.
     """
     # Check for command-specific help overrides
+    sub_tokens = _subcommand_tokens(subcommand)
+
     if command in HELP_SOURCE_OVERRIDES:
         help_source = HELP_SOURCE_OVERRIDES[command]
         cmd: list[str] | None = None
         if isinstance(help_source, list):
             cmd = help_source.copy()
         elif callable(help_source):
-            maybe = help_source(subcommand)
+            maybe = help_source(tuple(sub_tokens))
             if isinstance(maybe, list):
                 cmd = maybe
 
@@ -1433,9 +1733,7 @@ def get_help_text(*, command: str, subcommand: str | None = None) -> str | None:
                 pass
 
     # Fall back to standard help options
-    base_cmd = [command]
-    if subcommand:
-        base_cmd.append(subcommand)
+    base_cmd = [command, *sub_tokens]
 
     # Try different help options
     help_variants = [
@@ -1443,7 +1741,7 @@ def get_help_text(*, command: str, subcommand: str | None = None) -> str | None:
         base_cmd + ["-h"],
     ]
     # For some commands, help is a subcommand
-    if not subcommand:
+    if not sub_tokens:
         help_variants.append([command, "help"])
 
     for cmd in help_variants:
@@ -1464,7 +1762,27 @@ def get_help_text(*, command: str, subcommand: str | None = None) -> str | None:
     return None
 
 
-def get_man_text(*, command: str, subcommand: str | None = None) -> str | None:
+def _is_man_error_output(*, text: str) -> bool:
+    # Some man implementations write "No manual entry for ..." to stdout.
+    # Treat short error messages as missing docs so we can fall back to --help.
+    if not text or not text.strip():
+        return True
+    if len(text) > 300:
+        return False
+    lowered = text.strip().lower()
+    patterns = [
+        "no manual entry",
+        "no entry for",
+        "nothing appropriate",
+        "man: no entry",
+        "not found",
+    ]
+    return any(pat in lowered for pat in patterns)
+
+
+def get_man_text(
+    *, command: str, subcommand: SubcommandPath | None = None
+) -> str | None:
     """
     Get man page text for a command.
 
@@ -1473,7 +1791,8 @@ def get_man_text(*, command: str, subcommand: str | None = None) -> str | None:
     import os
 
     # Build man page name (git-commit for git commit, etc.)
-    man_page = f"{command}-{subcommand}" if subcommand else command
+    sub_tokens = _subcommand_tokens(subcommand)
+    man_page = f"{command}-{'-'.join(sub_tokens)}" if sub_tokens else command
 
     # Try with col -b to strip backspaces
     try:
@@ -1491,7 +1810,8 @@ def get_man_text(*, command: str, subcommand: str | None = None) -> str | None:
             },
         )
         if result.returncode == 0 and result.stdout:
-            return result.stdout
+            if not _is_man_error_output(text=result.stdout):
+                return result.stdout
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
@@ -1504,8 +1824,9 @@ def get_man_text(*, command: str, subcommand: str | None = None) -> str | None:
             timeout=10,
             env={**os.environ, "MANPAGER": "cat", "PAGER": "cat"},
         )
-        if result.returncode == 0:
-            return result.stdout
+        if result.returncode == 0 and result.stdout:
+            if not _is_man_error_output(text=result.stdout):
+                return result.stdout
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
@@ -1513,44 +1834,39 @@ def get_man_text(*, command: str, subcommand: str | None = None) -> str | None:
 
 
 def lookup_flag(
-    *, protocol: CommandProtocol, command: str, flag: str, subcommand: str | None = None
+    *,
+    protocol: CommandProtocol,
+    command: str,
+    flag: str,
+    subcommand: SubcommandPath | None = None,
 ) -> str | None:
     """Look up the description for a specific flag.
 
     - Ensures durable JSON exists under `~/.config/fish/shellock/data/`.
-    - Falls back from `(command, subcommand)` to `(command)` when needed.
+    - Falls back from deeper subcommand paths to parent scopes when needed.
     - Supports combined short flags (e.g., `-rf`).
     """
-    if subcommand is None:
-        data = ensure_command_scanned(protocol=protocol, command=command, refresh=False)
-        flags = data.get("flags", {})
-    else:
+    if subcommand:
         data = ensure_subcommand_scanned(
             protocol=protocol, command=command, subcommand=subcommand
         )
-        flags = (data.get("subcommands", {}).get(subcommand, {}) or {}).get("flags", {})
+    else:
+        data = ensure_command_scanned(protocol=protocol, command=command, refresh=False)
 
-    if flag in flags:
-        return flags[flag]
+    return lookup_flag_from_data(
+        data=data, command=command, flag=flag, subcommand=subcommand
+    )
 
-    if subcommand is not None:
-        # fall back to parent command
-        return lookup_flag(
-            protocol=protocol, command=command, flag=flag, subcommand=None
-        )
 
-    # Combined short flags: -rf => -r + -f
-    if re.match(r"^-[a-zA-Z]{2,}$", flag):
-        chars = flag[1:]
-        parts: list[str] = []
-        for char in chars:
-            single_flag = f"-{char}"
-            if single_flag in flags:
-                parts.append(f"{single_flag}: {flags[single_flag]}")
-        if parts:
-            return "Combination: " + " | ".join(parts)
-
-    return None
+def _collect_known_flags(payload: dict) -> set[str]:
+    raw_flags = payload.get("flags")
+    flags = set(raw_flags.keys()) if isinstance(raw_flags, dict) else set()
+    subcommands = payload.get("subcommands")
+    if isinstance(subcommands, dict):
+        for sub_payload in subcommands.values():
+            if isinstance(sub_payload, dict):
+                flags.update(_collect_known_flags(sub_payload))
+    return flags
 
 
 def explain_command(
@@ -1565,12 +1881,35 @@ def explain_command(
     if not parsed:
         return []
 
+    if not _command_exists(command=parsed.command):
+        return []
+
+    # Only trigger scans when the user has either started typing flags or has
+    # completed the command token (i.e., typed a space right after it).
+    try:
+        tokens = shlex.split(cmdline)
+    except ValueError:
+        tokens = cmdline.split()
+    trailing_space = cmdline != cmdline.rstrip()
+    command_only = len(tokens) == 1
+    has_flag_token = any(tok.startswith("-") for tok in tokens[1:])
+    wants_scan = bool(parsed.flags) or (trailing_space and command_only) or has_flag_token
+
     # Non-blocking: check if data exists without triggering a scan
     data = load_command_data(command=parsed.command)
 
     if data is None:
-        # No data yet - spawn background scan if not already running
-        if not is_scan_in_progress(command=parsed.command):
+        scan_in_progress = is_scan_in_progress(command=parsed.command)
+        if not wants_scan and not scan_in_progress:
+            return []
+        # No data yet - spawn background scan if not already running.
+        #
+        # When invoked from the fish integration, fish can manage the scan as a
+        # tracked child process and refresh the UI via `--on-process-exit`.
+        # In that mode we skip detached background scans here to avoid
+        # duplicate scans and to keep refresh behavior reliable.
+        fish_managed = os.environ.get("SHELLOCK_FISH_MANAGED_SCAN")
+        if not fish_managed and not scan_in_progress:
             spawn_background_scan(command=parsed.command)
         # Return "Learning..." indicator
         return [
@@ -1579,7 +1918,26 @@ def explain_command(
             )
         ]
 
-    # Data exists - proceed with lookup
+    if not parsed.flags:
+        return []
+
+    # Data exists - re-parse with known flags to avoid splitting
+    # single-dash long flags like -ngl when they are real options.
+    known_flags = _collect_known_flags(data)
+    known_subcommands = data.get("subcommands", {})
+    if not isinstance(known_subcommands, dict):
+        known_subcommands = None
+
+    parsed = (
+        parse_command_line(
+            cmdline=cmdline,
+            known_flags=known_flags,
+            known_subcommands=known_subcommands,
+        )
+        or parsed
+    )
+
+    # Proceed with lookup
     results: list[FlagDescription] = []
     seen: set[str] = set()
 
@@ -1592,7 +1950,7 @@ def explain_command(
             data=data,
             command=parsed.command,
             flag=flag.name,
-            subcommand=parsed.subcommand,
+            subcommand=parsed.subcommands,
         )
         results.append(
             FlagDescription(flag=flag.name, description=desc or "Unknown flag")
@@ -1602,31 +1960,47 @@ def explain_command(
 
 
 def lookup_flag_from_data(
-    *, data: dict, command: str, flag: str, subcommand: str | None = None
+    *,
+    data: dict,
+    command: str,
+    flag: str,
+    subcommand: SubcommandPath | None = None,
 ) -> str | None:
     """Look up flag description from already-loaded data (non-blocking)."""
+    nodes: list[dict] = []
     if subcommand:
-        subcommand_data = data.get("subcommands", {}).get(subcommand, {})
-        if subcommand_data:
-            flags = subcommand_data.get("flags", {})
-            if flag in flags:
-                return flags[flag]
-        # Fall back to main command flags
+        cursor: dict | None = data
+        for part in subcommand:
+            if not isinstance(cursor, dict):
+                break
+            subcommands = cursor.get("subcommands")
+            if not isinstance(subcommands, dict):
+                break
+            next_node = subcommands.get(part)
+            if not isinstance(next_node, dict):
+                break
+            nodes.append(next_node)
+            cursor = next_node
 
-    flags = data.get("flags", {})
-    if flag in flags:
-        return flags[flag]
+    search_nodes = list(reversed(nodes)) + [data]
 
-    # Combined short flags: -rf => -r + -f
-    if re.match(r"^-[a-zA-Z]{2,}$", flag):
-        chars = flag[1:]
-        parts: list[str] = []
-        for char in chars:
-            single_flag = f"-{char}"
-            if single_flag in flags:
-                parts.append(f"{single_flag}: {flags[single_flag]}")
-        if parts:
-            return "Combination: " + " | ".join(parts)
+    for node in search_nodes:
+        flags = node.get("flags", {}) if isinstance(node, dict) else {}
+        if not isinstance(flags, dict):
+            flags = {}
+        if flag in flags:
+            return flags[flag]
+
+        # Combined short flags: -rf => -r + -f
+        if re.match(r"^-[a-zA-Z]{2,}$", flag):
+            chars = flag[1:]
+            parts: list[str] = []
+            for char in chars:
+                single_flag = f"-{char}"
+                if single_flag in flags:
+                    parts.append(f"{single_flag}: {flags[single_flag]}")
+            if parts:
+                return "Combination: " + " | ".join(parts)
 
     return None
 
@@ -1710,7 +2084,11 @@ def main() -> int:
     lookup_p = subparsers.add_parser("lookup", help="Look up a specific flag")
     lookup_p.add_argument("command", help="Command name")
     lookup_p.add_argument("flag", help="Flag to look up (e.g., -r or --raw)")
-    lookup_p.add_argument("--subcommand", help="Subcommand (e.g., commit for git)")
+    lookup_p.add_argument(
+        "--subcommand",
+        nargs="+",
+        help="Subcommand path (e.g., remote add for git)",
+    )
 
     # explain command
     explain_p = subparsers.add_parser("explain", help="Explain all flags in command")
@@ -1732,15 +2110,21 @@ def main() -> int:
         model_default = cfg.strip()
     gen_p = subparsers.add_parser(
         "generate",
-        help="Generate and cache command data using an LLM agent (prefers man pages)",
+        help="Generate and cache command data using an LLM agent (honors doc_order)",
     )
     gen_p.add_argument("command", help="Command to generate data for")
     gen_p.add_argument("--agent", default="claude", choices=["claude"])
-    gen_p.add_argument("--model", default=model_default or "haiku")
+    gen_p.add_argument("--model", default=model_default or "sonnet")
     gen_p.add_argument(
         "--max-subcommands",
         type=int,
         default=_setting_int(config_key="llm_max_subcommands", default=25),
+    )
+    gen_p.add_argument(
+        "--max-depth",
+        type=int,
+        default=_max_subcommand_depth(),
+        help="Maximum subcommand depth to scan (default from config)",
     )
     gen_p.add_argument(
         "--max-doc-chars",
@@ -1784,11 +2168,14 @@ def main() -> int:
     if args.action == "parse":
         result = parse_command_line(cmdline=args.cmdline)
         if result:
+            subcommand_path = list(result.subcommands)
+            subcommand_label = " ".join(result.subcommands) if result.subcommands else None
             print(
                 json.dumps(
                     {
                         "command": result.command,
-                        "subcommand": result.subcommand,
+                        "subcommand": subcommand_label,
+                        "subcommands": subcommand_path,
                         "flags": [
                             {"name": f.name, "is_long": f.is_long} for f in result.flags
                         ],
@@ -1800,11 +2187,18 @@ def main() -> int:
         return 0
 
     elif args.action == "lookup":
+        subcommand_path: SubcommandPath | None = None
+        if args.subcommand:
+            tokens: list[str] = []
+            for item in args.subcommand:
+                tokens.extend(_subcommand_tokens(item))
+            if tokens:
+                subcommand_path = tuple(tokens)
         desc = lookup_flag(
             protocol=protocol,
             command=args.command,
             flag=args.flag,
-            subcommand=args.subcommand,
+            subcommand=subcommand_path,
         )
         if desc:
             print(desc)
@@ -1841,7 +2235,10 @@ def main() -> int:
             ensure_command_scanned(
                 protocol=protocol, command=args.command, refresh=False
             )
-            _notify_fish_scan_complete(command=args.command)
+            # When fish manages the scan as a child process, it can refresh via
+            # `--on-process-exit` and doesn't need the universal-variable signal.
+            if not os.environ.get("SHELLOCK_FISH_MANAGED_SCAN"):
+                _notify_fish_scan_complete(command=args.command)
         finally:
             lock_path.unlink(missing_ok=True)
         return 0
@@ -1859,6 +2256,7 @@ def main() -> int:
             max_subcommands=max(0, args.max_subcommands),
             max_doc_chars=max(1, args.max_doc_chars),
             timeout_s=max(1, args.timeout_s),
+            max_depth=max(0, args.max_depth),
         )
         save_command_data(command=args.command, data=data)
         if args.print:

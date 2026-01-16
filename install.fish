@@ -44,8 +44,8 @@ if not test -e "$shellock_config"
     printf '%s\n' \
         '{' \
         '  "scan_backend": "llm",' \
-        '  "doc_order": ["man", "help"],' \
-        '  "llm_model": "haiku",' \
+        '  "doc_order": ["help", "man"],' \
+        '  "llm_model": "sonnet",' \
         '  "llm_max_subcommands": 25,' \
         '  "llm_max_doc_chars": 30000,' \
         '  "llm_timeout_s": 180' \
